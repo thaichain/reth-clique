@@ -36,7 +36,7 @@ use alloy_primitives::{
     TxHash, B256,
 };
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
@@ -1364,6 +1364,50 @@ impl<T: TransactionOrdering> TxPool<T> {
     /// Whether the pool is empty
     pub(crate) fn is_empty(&self) -> bool {
         self.all_transactions.is_empty()
+    }
+
+    /// Returns the ids of all senders and EIP-7702 authorities that the pool still references.
+    ///
+    /// These are the senders of all pooled transactions and the authorities of their
+    /// authorization lists. With [`PoolConfig::enforce_tracked_nonce`], this additionally covers
+    /// all senders with tracked state, because that state must survive the sender's transactions.
+    ///
+    /// The mapping of any other id can be dropped from the sender identifiers without leaving a
+    /// dangling reference inside of this pool.
+    pub(crate) fn referenced_sender_ids(&self) -> FxHashSet<SenderId> {
+        let mut ids = FxHashSet::with_capacity_and_hasher(
+            self.all_transactions.tx_counter.len(),
+            Default::default(),
+        );
+        for tx in self.all_transactions.transactions_iter() {
+            ids.insert(tx.sender_id());
+            if let Some(authorities) = &tx.authority_ids {
+                ids.extend(authorities.iter().copied());
+            }
+        }
+        if self.config.enforce_tracked_nonce {
+            ids.extend(self.all_transactions.sender_info.keys().copied());
+        }
+        ids
+    }
+
+    /// Drops the tracked state of senders without pooled transactions.
+    ///
+    /// This is a noop with [`PoolConfig::enforce_tracked_nonce`], because that state is kept on
+    /// purpose, see [`AllTransactions::sender_info`].
+    pub(crate) fn clear_idle_sender_info(&mut self) {
+        if self.config.enforce_tracked_nonce {
+            return
+        }
+        let all = &mut self.all_transactions;
+        all.sender_info.retain(|sender, _| all.tx_counter.contains_key(sender));
+    }
+
+    /// Updates the metrics for the sender identifiers, given how many are currently tracked and
+    /// how many were just pruned.
+    pub(crate) fn update_sender_identifier_metrics(&self, tracked: usize, pruned: usize) {
+        self.metrics.sender_identifiers.set(tracked as f64);
+        self.metrics.pruned_sender_identifiers.increment(pruned as u64);
     }
 
     /// Asserts all invariants of the  pool's:
@@ -4379,6 +4423,59 @@ mod tests {
             MockOrdering::default(),
             PoolConfig { enforce_tracked_nonce: true, ..Default::default() },
         )
+    }
+
+    #[test]
+    fn referenced_sender_ids_cover_senders_and_authorities() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+
+        let mut first = f.validated(MockTransaction::eip1559());
+        let first_sender = first.sender_id();
+        let first_authority = SenderId::from(100);
+        first.authority_ids = Some(vec![first_authority]);
+        pool.add_transaction(first, U256::from(1_000), 0, None).unwrap();
+
+        let mut second = f.validated(MockTransaction::eip1559());
+        let second_sender = second.sender_id();
+        let second_authority = SenderId::from(101);
+        second.authority_ids = Some(vec![second_authority]);
+        let second_hash = *second.hash();
+        pool.add_transaction(second, U256::from(1_000), 0, None).unwrap();
+
+        let expected =
+            FxHashSet::from_iter([first_sender, second_sender, first_authority, second_authority]);
+        assert_eq!(pool.referenced_sender_ids(), expected);
+
+        pool.remove_transactions(vec![second_hash]);
+        let expected = FxHashSet::from_iter([first_sender, first_authority]);
+        assert_eq!(pool.referenced_sender_ids(), expected);
+    }
+
+    #[test]
+    fn idle_sender_info_is_cleared() {
+        let mut f = MockTransactionFactory::default();
+        let tx = f.validated(MockTransaction::eip1559());
+        let sender = tx.sender_id();
+
+        // Info of senders without transactions, such as left behind by account updates, is dropped
+        // while the info of senders with transactions is kept.
+        let mut pool = TxPool::new(MockOrdering::default(), Default::default());
+        pool.add_transaction(tx.clone(), U256::from(1_000), 0, None).unwrap();
+        let idle = SenderId::from(1_000);
+        let info = || SenderInfo { state_nonce: 1, balance: U256::from(1_000) };
+        pool.all_transactions.sender_info.insert(idle, info());
+        pool.clear_idle_sender_info();
+        assert!(pool.all_transactions.sender_info.contains_key(&sender));
+        assert!(!pool.all_transactions.sender_info.contains_key(&idle));
+
+        // With `enforce_tracked_nonce` it is retained and counts as referenced.
+        let mut pool = stale_validation_pool();
+        pool.add_transaction(tx, U256::from(1_000), 0, None).unwrap();
+        pool.all_transactions.sender_info.insert(idle, info());
+        pool.clear_idle_sender_info();
+        assert!(pool.all_transactions.sender_info.contains_key(&idle));
+        assert!(pool.referenced_sender_ids().contains(&idle));
     }
 
     #[test]

@@ -102,7 +102,7 @@ use rustc_hash::FxHashMap;
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -143,6 +143,9 @@ where
 {
     /// Internal mapping of addresses to plain ints.
     identifiers: RwLock<SenderIdentifiers>,
+    /// Number of identifiers that were retained by the most recent prune, see
+    /// [`Self::prune_sender_identifiers`].
+    sender_id_prune_watermark: AtomicUsize,
     /// Transaction validator.
     validator: V,
     /// Storage for blob transactions
@@ -177,6 +180,7 @@ where
     pub fn new(validator: V, ordering: T, blob_store: S, config: PoolConfig) -> Self {
         Self {
             identifiers: Default::default(),
+            sender_id_prune_watermark: AtomicUsize::new(0),
             validator,
             event_listener: Default::default(),
             has_event_listeners: AtomicBool::new(false),
@@ -221,6 +225,11 @@ where
     /// This must only be used on paths that intentionally begin tracking a sender, such as
     /// transaction insertion. Read-only lookups should prefer [`Self::sender_id`] to avoid
     /// growing the sender-id map for unknown addresses.
+    ///
+    /// Unused identifiers are pruned, see [`Self::prune_sender_identifiers`]. Callers that
+    /// allocate identifiers outside of the pool's own insertion path must disable automatic
+    /// pruning via [`PoolConfig::sender_id_prune_threshold`] and prune manually, otherwise the
+    /// identifier they obtained can be removed again before it is used.
     pub fn get_sender_id(&self, addr: Address) -> SenderId {
         self.identifiers.write().sender_id_or_create(addr)
     }
@@ -233,9 +242,85 @@ where
         self.identifiers.read().sender_id(addr)
     }
 
-    /// Returns the internal [`SenderId`]s for the given addresses.
+    /// Returns the internal [`SenderId`]s for the given addresses, allocating a new mapping for
+    /// every address that is not tracked yet.
+    ///
+    /// See [`Self::get_sender_id`] for the pruning contract.
     pub fn get_sender_ids(&self, addrs: impl IntoIterator<Item = Address>) -> Vec<SenderId> {
         self.identifiers.write().sender_ids_or_create(addrs)
+    }
+
+    /// Removes the mappings of all [`SenderId`]s that are no longer in use and returns how many
+    /// were removed.
+    ///
+    /// An identifier is in use if a pooled transaction references it, either as its sender or as
+    /// an EIP-7702 authority, or if `keep_external` returns `true` for it. Identifiers are never
+    /// reused, so an address that is tracked again after its identifier was pruned is assigned a
+    /// new one.
+    ///
+    /// This is invoked automatically after canonical state updates once the number of identifiers
+    /// exceeds [`PoolConfig::sender_id_prune_threshold`]. Pools that allocate identifiers outside
+    /// of the pool's insertion path with [`Self::get_sender_id`] or [`Self::get_sender_ids`],
+    /// for example to track transactions in a separate pool, must disable the automatic pruning
+    /// by setting the threshold to `None` and call this method instead, because the pool cannot
+    /// know about identifiers it does not hold transactions for.
+    ///
+    /// # Locking
+    ///
+    /// This takes the pool's write lock, and then the identifiers' write lock. The pool's own
+    /// insertion path allocates identifiers while holding the pool's write lock, so pruning cannot
+    /// remove an identifier of a transaction that is currently being inserted. Callers that
+    /// allocate identifiers on their own must ensure that no allocation, or use of an allocated
+    /// identifier that `keep_external` doesn't cover yet, can run concurrently, for example by
+    /// holding their own lock around both the allocation and this call. That lock must always be
+    /// acquired before the pool's.
+    ///
+    /// `keep_external` runs while the identifiers are locked and must not call back into the pool.
+    pub fn prune_sender_identifiers(&self, keep_external: impl FnMut(&SenderId) -> bool) -> usize {
+        let mut pool = self.pool.write();
+        self.prune_sender_identifiers_locked(&mut pool, keep_external)
+    }
+
+    /// Prunes the sender identifiers, see [`Self::prune_sender_identifiers`].
+    ///
+    /// The caller must hold the pool's write lock.
+    fn prune_sender_identifiers_locked(
+        &self,
+        pool: &mut TxPool<T>,
+        mut keep_external: impl FnMut(&SenderId) -> bool,
+    ) -> usize {
+        let referenced = pool.referenced_sender_ids();
+        // The tracked state of senders without transactions is keyed by their identifier and would
+        // be orphaned by pruning it.
+        pool.clear_idle_sender_info();
+
+        let mut identifiers = self.identifiers.write();
+        let pruned = identifiers.retain(|id| referenced.contains(id) || keep_external(id));
+        let tracked = identifiers.len();
+        drop(identifiers);
+
+        self.sender_id_prune_watermark.store(tracked, Ordering::Relaxed);
+        pool.update_sender_identifier_metrics(tracked, pruned);
+        pruned
+    }
+
+    /// Prunes the sender identifiers if the configured threshold is exceeded.
+    ///
+    /// Pruning scans the entire pool and can't remove identifiers that are still referenced, so
+    /// besides exceeding the threshold, the number of identifiers must also have doubled since the
+    /// last prune. This amortizes the scan.
+    ///
+    /// The caller must hold the pool's write lock.
+    fn maybe_prune_sender_identifiers(&self, pool: &mut TxPool<T>) {
+        let tracked = self.identifiers.read().len();
+        pool.update_sender_identifier_metrics(tracked, 0);
+
+        let Some(threshold) = self.config.sender_id_prune_threshold else { return };
+        let watermark = self.sender_id_prune_watermark.load(Ordering::Relaxed);
+        if tracked > threshold.max(watermark.saturating_mul(2)) {
+            let pruned = self.prune_sender_identifiers_locked(pool, |_| false);
+            debug!(target: "txpool", tracked, pruned, "pruned unused sender identifiers");
+        }
     }
 
     /// Returns all senders in the pool
@@ -538,15 +623,21 @@ where
         } = update;
         self.validator.on_new_head_block(new_tip);
 
-        let changed_senders = self.changed_senders(changed_accounts.into_iter());
-
-        // update the pool
-        let outcome = self.pool.write().on_canonical_state_change(
-            block_info,
-            mined_transactions,
-            changed_senders,
-            update_kind,
-        );
+        // The changed senders are resolved while holding the pool lock: identifiers are only pruned
+        // under this lock, so a resolved identifier can't be pruned and reassigned before the
+        // update is applied.
+        let outcome = {
+            let mut pool = self.pool.write();
+            let changed_senders = self.changed_senders(changed_accounts.into_iter());
+            let outcome = pool.on_canonical_state_change(
+                block_info,
+                mined_transactions,
+                changed_senders,
+                update_kind,
+            );
+            self.maybe_prune_sender_identifiers(&mut pool);
+            outcome
+        };
 
         // This will discard outdated transactions based on the account's nonce
         self.delete_discarded_blobs(outcome.discarded.iter());
@@ -561,9 +652,12 @@ where
     ///
     /// This should be invoked when the pool drifted and accounts are updated manually
     pub fn update_accounts(&self, accounts: Vec<ChangedAccount>) {
-        let changed_senders = self.changed_senders(accounts.into_iter());
-        let UpdateOutcome { promoted, discarded } =
-            self.pool.write().update_accounts(changed_senders);
+        let UpdateOutcome { promoted, discarded } = {
+            // Resolve the senders under the pool lock, see `Self::on_canonical_state_change`.
+            let mut pool = self.pool.write();
+            let changed_senders = self.changed_senders(accounts.into_iter());
+            pool.update_accounts(changed_senders)
+        };
 
         self.notify_on_transaction_updates(promoted, discarded);
     }
@@ -1736,14 +1830,17 @@ mod tests {
         identifier::SenderId,
         test_utils::{testing_pool, MockTransaction, TestPool, TestPoolBuilder},
         validate::ValidTransaction,
-        BlockInfo, FullTransactionEvent, PoolConfig, SubPool, SubPoolLimit,
-        TransactionListenerKind, TransactionOrigin, TransactionPool, TransactionPoolExt,
-        TransactionValidationOutcome, ValidPoolTransaction, U256,
+        BlockInfo, CanonicalStateUpdate, FullTransactionEvent, PoolConfig, PoolTransaction,
+        PoolUpdateKind, SubPool, SubPoolLimit, TransactionListenerKind, TransactionOrigin,
+        TransactionPool, TransactionPoolExt, TransactionValidationOutcome, ValidPoolTransaction,
+        U256,
     };
     use alloy_consensus::Transaction;
     use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant};
     use alloy_primitives::{Address, B256};
     use futures_util::{FutureExt, StreamExt};
+    use reth_execution_types::ChangedAccount;
+    use reth_primitives_traits::SealedBlock;
     use std::{fs, path::PathBuf, sync::Arc};
     use tokio::sync::mpsc::error::TryRecvError;
 
@@ -2086,6 +2183,183 @@ mod tests {
 
         let identifiers = test_pool.identifiers.read();
         assert_eq!(identifiers.sender_id(&auth), Some(SenderId::from(1)));
+    }
+
+    fn valid_outcome(
+        transaction: MockTransaction,
+        authorities: Option<Vec<Address>>,
+    ) -> TransactionValidationOutcome<MockTransaction> {
+        TransactionValidationOutcome::Valid {
+            balance: U256::MAX,
+            state_nonce: 0,
+            bytecode_hash: None,
+            transaction: ValidTransaction::Valid(transaction),
+            propagate: true,
+            authorities,
+        }
+    }
+
+    /// Adds a transaction from `sender` that is accepted by the pool.
+    fn add_valid(pool: &TestPool, sender: Address, nonce: u64) -> B256 {
+        let tx = MockTransaction::eip1559().with_sender(sender).with_nonce(nonce);
+        let hash = *tx.hash();
+        pool.pool.add_transactions(TransactionOrigin::External, [valid_outcome(tx, None)])[0]
+            .as_ref()
+            .unwrap();
+        hash
+    }
+
+    /// Applies a canonical state update that mines the given transactions.
+    fn mine(pool: &TestPool, mined_transactions: Vec<B256>, changed_accounts: Vec<ChangedAccount>) {
+        let tip = SealedBlock::seal_slow(reth_ethereum_primitives::Block::default());
+        pool.on_canonical_state_change(CanonicalStateUpdate {
+            new_tip: &tip,
+            pending_block_base_fee: 0,
+            pending_block_blob_fee: None,
+            changed_accounts,
+            mined_transactions,
+            update_kind: PoolUpdateKind::Commit,
+        });
+    }
+
+    #[test]
+    fn prune_sender_identifiers_keeps_referenced_ids() {
+        let pool = &testing_pool();
+        let inner = pool.inner();
+        let pooled = Address::with_last_byte(1);
+        let authority = Address::with_last_byte(2);
+        let removed = Address::with_last_byte(3);
+        let rejected = Address::with_last_byte(4);
+        let external = Address::with_last_byte(5);
+        let unused = Address::with_last_byte(6);
+
+        // pooled sender with a pooled authority
+        let tx = MockTransaction::eip7702().with_sender(pooled);
+        pool.pool.add_transactions(
+            TransactionOrigin::External,
+            [valid_outcome(tx, Some(vec![authority]))],
+        )[0]
+        .as_ref()
+        .unwrap();
+        // a sender whose only transaction is removed again
+        let removed_hash = add_valid(pool, removed, 0);
+        assert_eq!(pool.remove_transactions(vec![removed_hash]).len(), 1);
+        // a sender whose transaction is rejected after the id was allocated
+        let tx = MockTransaction::eip1559().with_sender(rejected).with_gas_limit(u64::MAX);
+        assert!(pool.pool.add_transactions(TransactionOrigin::External, [valid_outcome(tx, None)])
+            [0]
+        .is_err());
+        // ids that are allocated outside of the pool
+        inner.get_sender_ids([external, unused]);
+
+        let pooled_id = inner.sender_id(&pooled).unwrap();
+        let authority_id = inner.sender_id(&authority).unwrap();
+        let external_id = inner.sender_id(&external).unwrap();
+        for address in [&removed, &rejected, &unused] {
+            assert!(inner.sender_id(address).is_some());
+        }
+        assert_eq!(inner.identifiers.read().len(), 6);
+
+        let pruned = inner.prune_sender_identifiers(|id| *id == external_id);
+        assert_eq!(pruned, 3);
+        assert_eq!(inner.identifiers.read().len(), 3);
+        for address in [&removed, &rejected, &unused] {
+            assert_eq!(inner.sender_id(address), None);
+        }
+        assert_eq!(inner.sender_id(&pooled), Some(pooled_id));
+        assert_eq!(inner.sender_id(&authority), Some(authority_id));
+        assert_eq!(inner.sender_id(&external), Some(external_id));
+        assert_eq!(inner.identifiers.read().address(&authority_id), Some(&authority));
+
+        // a second prune has nothing left to remove
+        assert_eq!(inner.prune_sender_identifiers(|id| *id == external_id), 0);
+
+        // the pooled sender keeps its id, so new transactions line up with the pooled ones
+        add_valid(pool, pooled, 1);
+        assert_eq!(inner.sender_id(&pooled), Some(pooled_id));
+        assert_eq!(pool.get_transactions_by_sender(pooled).len(), 2);
+        assert_eq!(inner.get_sender_id(pooled), pooled_id);
+
+        // pruned senders are assigned new ids that are never reused
+        let max_id = [pooled_id, authority_id, external_id].into_iter().max().unwrap();
+        add_valid(pool, removed, 0);
+        assert!(inner.sender_id(&removed).unwrap() > max_id);
+        assert_eq!(pool.get_transactions_by_sender(removed).len(), 1);
+    }
+
+    #[test]
+    fn prune_sender_identifiers_removes_idle_sender_info() {
+        let sender = Address::with_last_byte(1);
+
+        // Senders without transactions have no use for their tracked state, so it is dropped along
+        // with the id.
+        let pool = &testing_pool();
+        let hash = add_valid(pool, sender, 0);
+        mine(
+            pool,
+            vec![hash],
+            vec![ChangedAccount { address: sender, nonce: 1, balance: U256::MAX }],
+        );
+        assert_eq!(pool.inner().prune_sender_identifiers(|_| false), 1);
+        assert_eq!(pool.inner().sender_id(&sender), None);
+        assert!(pool.inner().get_pool_data().referenced_sender_ids().is_empty());
+        pool.inner().get_pool_data().assert_invariants();
+
+        // With `enforce_tracked_nonce` the tracked state must survive, and so does its id.
+        let config = PoolConfig { enforce_tracked_nonce: true, ..Default::default() };
+        let pool = &TestPool::from(TestPoolBuilder::default().with_config(config));
+        let hash = add_valid(pool, sender, 0);
+        mine(
+            pool,
+            vec![hash],
+            vec![ChangedAccount { address: sender, nonce: 1, balance: U256::MAX }],
+        );
+        let id = pool.inner().sender_id(&sender).unwrap();
+        assert_eq!(pool.inner().prune_sender_identifiers(|_| false), 0);
+        assert_eq!(pool.inner().sender_id(&sender), Some(id));
+    }
+
+    #[test]
+    fn prunes_sender_identifiers_on_canonical_state_change() {
+        let senders = (1..=4).map(Address::with_last_byte).collect::<Vec<_>>();
+        let setup = |threshold| {
+            let config = PoolConfig::default().with_sender_id_prune_threshold(threshold);
+            let pool = TestPool::from(TestPoolBuilder::default().with_config(config));
+            let hashes = senders.iter().map(|sender| add_valid(&pool, *sender, 0));
+            let hashes = hashes.collect::<Vec<_>>();
+            (pool, hashes)
+        };
+
+        // below the threshold nothing is pruned
+        let (pool, hashes) = setup(Some(4));
+        mine(&pool, hashes[1..].to_vec(), Vec::new());
+        assert_eq!(pool.inner().identifiers.read().len(), 4);
+
+        // disabled
+        let (pool, hashes) = setup(None);
+        mine(&pool, hashes[1..].to_vec(), Vec::new());
+        assert_eq!(pool.inner().identifiers.read().len(), 4);
+        assert_eq!(pool.inner().prune_sender_identifiers(|_| false), 3);
+
+        // above the threshold only the ids of the remaining transactions are kept
+        let (pool, hashes) = setup(Some(3));
+        let ids = senders[..2].iter().map(|sender| pool.inner().sender_id(sender).unwrap());
+        let ids = ids.collect::<Vec<_>>();
+        mine(&pool, hashes[2..].to_vec(), Vec::new());
+        assert_eq!(pool.inner().identifiers.read().len(), 2);
+        for (sender, id) in senders.iter().zip(ids) {
+            assert_eq!(pool.inner().sender_id(sender), Some(id));
+            assert_eq!(pool.get_transactions_by_sender(*sender).len(), 1);
+        }
+
+        // The next prune is only attempted once the ids doubled since the last one, even though
+        // the threshold is exceeded.
+        pool.inner().get_sender_ids(senders[2..].iter().copied());
+        mine(&pool, Vec::new(), Vec::new());
+        assert_eq!(pool.inner().identifiers.read().len(), 4);
+        pool.inner().get_sender_ids([Address::with_last_byte(5)]);
+        mine(&pool, Vec::new(), Vec::new());
+        assert_eq!(pool.inner().identifiers.read().len(), 2);
     }
 
     #[test]

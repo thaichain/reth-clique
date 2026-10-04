@@ -45,6 +45,37 @@ impl SenderIdentifiers {
         addrs.into_iter().map(|addr| self.sender_id_or_create(addr)).collect()
     }
 
+    /// Returns the number of addresses that currently have an assigned [`SenderId`].
+    pub fn len(&self) -> usize {
+        self.sender_to_address.len()
+    }
+
+    /// Returns `true` if no address currently has an assigned [`SenderId`].
+    pub fn is_empty(&self) -> bool {
+        self.sender_to_address.is_empty()
+    }
+
+    /// Removes the mapping of every [`SenderId`] for which `keep` returns `false` and returns how
+    /// many mappings were removed.
+    ///
+    /// Identifiers are never reused: the counter is not rewound, so an address that is assigned an
+    /// identifier again after its mapping was removed receives a new, larger [`SenderId`].
+    ///
+    /// Callers must only remove identifiers that are not referenced by any
+    /// [`TransactionId`] anymore, and must prevent concurrent allocations for the same address
+    /// while doing so. Otherwise the same sender could end up with two different identifiers.
+    pub fn retain(&mut self, mut keep: impl FnMut(&SenderId) -> bool) -> usize {
+        let before = self.sender_to_address.len();
+        self.sender_to_address.retain(|id, addr| {
+            let retain = keep(id);
+            if !retain {
+                self.address_to_id.remove(addr);
+            }
+            retain
+        });
+        before - self.sender_to_address.len()
+    }
+
     /// Returns the current identifier and increments the counter.
     fn next_id(&mut self) -> SenderId {
         let id = self.id;
@@ -246,6 +277,54 @@ mod tests {
         let id1 = identifiers.sender_id_or_create(address1);
         let id2 = identifiers.sender_id_or_create(address2);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_retain_removes_both_mappings() {
+        let mut identifiers = SenderIdentifiers::default();
+        let address1 = Address::new([1; 20]);
+        let address2 = Address::new([2; 20]);
+        let address3 = Address::new([3; 20]);
+        let id1 = identifiers.sender_id_or_create(address1);
+        let id2 = identifiers.sender_id_or_create(address2);
+        let id3 = identifiers.sender_id_or_create(address3);
+        assert_eq!(identifiers.len(), 3);
+        assert!(!identifiers.is_empty());
+
+        let pruned = identifiers.retain(|id| *id == id2);
+        assert_eq!(pruned, 2);
+        assert_eq!(identifiers.len(), 1);
+
+        assert_eq!(identifiers.sender_id(&address2), Some(id2));
+        assert_eq!(identifiers.address(&id2), Some(&address2));
+        for (address, id) in [(address1, id1), (address3, id3)] {
+            assert_eq!(identifiers.sender_id(&address), None);
+            assert_eq!(identifiers.address(&id), None);
+        }
+
+        assert_eq!(identifiers.retain(|_| false), 1);
+        assert!(identifiers.is_empty());
+        assert_eq!(identifiers.retain(|_| false), 0);
+    }
+
+    #[test]
+    fn test_retain_never_reuses_ids() {
+        let mut identifiers = SenderIdentifiers::default();
+        let address1 = Address::new([1; 20]);
+        let address2 = Address::new([2; 20]);
+        let id1 = identifiers.sender_id_or_create(address1);
+        let id2 = identifiers.sender_id_or_create(address2);
+
+        identifiers.retain(|_| false);
+        assert!(identifiers.is_empty());
+
+        // A re-added address gets a fresh, larger id, and so does a new address.
+        let new_id1 = identifiers.sender_id_or_create(address1);
+        assert!(new_id1 > id2);
+        assert_ne!(new_id1, id1);
+        let new_id3 = identifiers.sender_id_or_create(Address::new([3; 20]));
+        assert!(new_id3 > new_id1);
+        assert_eq!(identifiers.len(), 2);
     }
 
     #[test]

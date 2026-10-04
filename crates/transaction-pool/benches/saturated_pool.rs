@@ -98,7 +98,9 @@ fn build_saturated_pool() -> (BenchPool, u64) {
         MockTransactionValidator::default(),
         MockOrdering::default(),
         InMemoryBlobStore::default(),
-        PoolConfig::default(),
+        // The benchmarks allocate sender ids outside of the pool, which automatic pruning would
+        // remove again.
+        PoolConfig { sender_id_prune_threshold: None, ..Default::default() },
     );
 
     let block = tip_block();
@@ -149,7 +151,11 @@ fn build_single_tx_sender_pool(senders: usize) -> (BenchPool, u64) {
         MockTransactionValidator::default(),
         MockOrdering::default(),
         InMemoryBlobStore::default(),
-        PoolConfig { pending_limit: SubPoolLimit::max(), ..Default::default() },
+        PoolConfig {
+            pending_limit: SubPoolLimit::max(),
+            sender_id_prune_threshold: None,
+            ..Default::default()
+        },
     );
 
     let block = tip_block();

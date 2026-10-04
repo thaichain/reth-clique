@@ -34,6 +34,13 @@ pub const MAX_NEW_PENDING_TXS_NOTIFICATIONS: usize = 200;
 /// Default maximum allowed in flight delegated transactions per account.
 pub const DEFAULT_MAX_INFLIGHT_DELEGATED_SLOTS: usize = 1;
 
+/// The default number of tracked sender identifiers above which the pool starts pruning unused
+/// ones.
+///
+/// Every identifier takes roughly 100 bytes, so this bounds the identifier maps of a default
+/// configured pool to a few MB.
+pub const DEFAULT_SENDER_ID_PRUNE_THRESHOLD: usize = 100_000;
+
 /// Configuration options for the Transaction pool.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
@@ -79,6 +86,23 @@ pub struct PoolConfig {
     /// mined nonce as pending. Assumes sender nonces only move forward, so this is primarily
     /// recommended for chains without reorgs and very low block times. Disabled by default.
     pub enforce_tracked_nonce: bool,
+    /// Number of tracked sender identifiers above which the pool prunes identifiers that no
+    /// pooled transaction references anymore after a canonical state update. `None` disables
+    /// automatic pruning.
+    ///
+    /// The pool assigns an internal identifier to every sender (and EIP-7702 authority) of a
+    /// valid transaction, which would otherwise be kept for the lifetime of the process. Pruning
+    /// scans the whole pool, so it only runs once the number of identifiers exceeds this threshold
+    /// and has doubled since the last prune.
+    ///
+    /// Automatic pruning is only sound if all identifiers are allocated while holding the pool's
+    /// internal lock, which is the case for transactions inserted through the pool. Pools that
+    /// allocate identifiers on their own (through
+    /// [`PoolInner::get_sender_id`](crate::pool::PoolInner::get_sender_id) or
+    /// [`PoolInner::get_sender_ids`](crate::pool::PoolInner::get_sender_ids)) must set this to
+    /// `None` and prune manually with
+    /// [`PoolInner::prune_sender_identifiers`](crate::pool::PoolInner::prune_sender_identifiers).
+    pub sender_id_prune_threshold: Option<usize>,
 }
 
 impl PoolConfig {
@@ -114,6 +138,14 @@ impl PoolConfig {
         self
     }
 
+    /// Configures the number of tracked sender identifiers above which unused identifiers are
+    /// pruned automatically, or disables automatic pruning with `None`, see
+    /// [`Self::sender_id_prune_threshold`].
+    pub const fn with_sender_id_prune_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.sender_id_prune_threshold = threshold;
+        self
+    }
+
     /// Returns whether the size and amount constraints in any sub-pools are exceeded.
     #[inline]
     pub const fn is_exceeded(&self, pool_size: PoolSize) -> bool {
@@ -144,6 +176,7 @@ impl Default for PoolConfig {
             max_queued_lifetime: MAX_QUEUED_TRANSACTION_LIFETIME,
             max_inflight_delegated_slot_limit: DEFAULT_MAX_INFLIGHT_DELEGATED_SLOTS,
             enforce_tracked_nonce: false,
+            sender_id_prune_threshold: Some(DEFAULT_SENDER_ID_PRUNE_THRESHOLD),
         }
     }
 }
