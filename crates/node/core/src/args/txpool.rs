@@ -556,8 +556,10 @@ impl RethTransactionPoolConfig for TxPoolArgs {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use alloy_primitives::address;
+
     use clap::Parser;
 
     /// A helper type to parse Args more easily

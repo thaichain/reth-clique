@@ -454,8 +454,10 @@ pub(crate) fn parse_receipts_log_filter(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use alloy_primitives::address;
+
     use clap::Parser;
     use reth_chainspec::MAINNET;
 

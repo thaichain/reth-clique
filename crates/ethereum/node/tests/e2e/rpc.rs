@@ -887,6 +887,7 @@ async fn test_eth_config() -> eyre::Result<()> {
 async fn test_sepolia_amsterdam_eth_config() -> eyre::Result<()> {
     use alloy_consensus::Header;
     use alloy_primitives::hex;
+
     use reth_chainspec::{
         sepolia::{SEPOLIA_AMSTERDAM_TIMESTAMP, SEPOLIA_BPO2_TIMESTAMP},
         SEPOLIA,

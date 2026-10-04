@@ -225,9 +225,10 @@ pub fn payload_id(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use alloy_eips::eip4895::Withdrawal;
-    use alloy_primitives::{Address, B64};
+    use alloy_primitives::{b64, Address};
     use core::str::FromStr;
 
     #[test]
@@ -259,10 +260,7 @@ mod tests {
         };
 
         // Verify that the generated payload ID matches the expected value
-        assert_eq!(
-            payload_id(&parent, &attributes),
-            PayloadId(B64::from_str("0xa247243752eb10b4").unwrap())
-        );
+        assert_eq!(payload_id(&parent, &attributes), PayloadId(b64!("0xa247243752eb10b4")));
     }
 
     #[test]
@@ -298,10 +296,7 @@ mod tests {
         };
 
         // Verify that the generated payload ID matches the expected value
-        assert_eq!(
-            payload_id(&parent, &attributes),
-            PayloadId(B64::from_str("0xedddc2f84ba59865").unwrap())
-        );
+        assert_eq!(payload_id(&parent, &attributes), PayloadId(b64!("0xedddc2f84ba59865")));
     }
 
     #[test]
@@ -327,15 +322,13 @@ mod tests {
                 )
                 .unwrap(),
             ),
+
             slot_number: None,
             ..Default::default()
         };
 
         // Verify that the generated payload ID matches the expected value
-        assert_eq!(
-            payload_id(&parent, &attributes),
-            PayloadId(B64::from_str("0x0fc49cd532094cce").unwrap())
-        );
+        assert_eq!(payload_id(&parent, &attributes), PayloadId(b64!("0x0fc49cd532094cce")));
     }
 
     #[test]

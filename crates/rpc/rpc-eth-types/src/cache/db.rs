@@ -31,14 +31,13 @@ pub fn attach_bal_before_tx<DB: Database>(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use alloy_primitives::{address, Bytes, U256};
-    use revm::{
-        database::{CacheDB, EmptyDB},
-        state::{
-            bal::{AccountBal, Bal, BalWrites, BlockAccessIndex},
-            AccountInfo,
-        },
+    use reth_revm::db::InMemoryDB;
+    use revm::state::{
+        bal::{AccountBal, Bal, BalWrites, BlockAccessIndex},
+        AccountInfo,
     };
 
     #[test]
@@ -49,7 +48,7 @@ mod tests {
         let read_slot = U256::from(2);
 
         // pre-block state
-        let mut db = CacheDB::new(EmptyDB::default());
+        let mut db = InMemoryDB::default();
         db.insert_account_info(
             covered,
             AccountInfo { balance: U256::from(7), nonce: 5, ..Default::default() },

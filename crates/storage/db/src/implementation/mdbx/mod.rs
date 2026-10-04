@@ -676,6 +676,7 @@ impl Deref for DatabaseEnv {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::{
         tables::{
@@ -695,6 +696,7 @@ mod tests {
     use reth_primitives_traits::{Account, StorageEntry};
     use reth_storage_errors::db::{DatabaseWriteError, DatabaseWriteOperation};
     use std::str::FromStr;
+
     use tempfile::TempDir;
 
     /// Create database for testing. Returns the `TempDir` to prevent cleanup until test ends.
@@ -722,8 +724,8 @@ mod tests {
     const ERROR_COMMIT: &str = "Not able to commit transaction.";
     const ERROR_RETURN_VALUE: &str = "Mismatching result.";
     const ERROR_INIT_TX: &str = "Failed to create a MDBX transaction.";
-    const ERROR_ETH_ADDRESS: &str = "Invalid address.";
 
+    const ERROR_ETH_ADDRESS: &str = "Invalid address.";
     #[test]
     fn db_creation() {
         let _tempdir = create_test_db(DatabaseEnvKind::RW);
