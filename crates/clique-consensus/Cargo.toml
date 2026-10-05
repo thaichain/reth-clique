@@ -1,0 +1,27 @@
+[package]
+name = "clique-consensus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Clique PoA consensus for reth — a port of go-ethereum's consensus/clique (EIP-225)"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus.workspace = true
+alloy-primitives = { workspace = true, features = ["std", "k256"] }
+alloy-rlp.workspace = true
+reth-chainspec.workspace = true
+reth-consensus.workspace = true
+reth-consensus-common.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-execution-types.workspace = true
+reth-primitives-traits.workspace = true
+
+lru.workspace = true
+
+[dev-dependencies]
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+serde_json.workspace = true

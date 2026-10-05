@@ -1,0 +1,44 @@
+[package]
+name = "clique-node"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Clique PoA node built on reth — NodeTypes impl, chain spec parser, and the follow-mode sync driver"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["std"] }
+alloy-provider = { workspace = true, features = ["ws"] }
+alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+clique-chainspec.workspace = true
+clique-consensus.workspace = true
+reth-chainspec.workspace = true
+reth-cli.workspace = true
+reth-engine-primitives.workspace = true
+reth-ethereum = { workspace = true, features = ["node", "cli"] }
+reth-ethereum-engine-primitives.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-payload-builder.workspace = true
+reth-network.workspace = true
+reth-rpc-server-types.workspace = true
+reth-payload-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-storage-errors.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+
+clap.workspace = true
+jsonrpsee.workspace = true
+derive_more.workspace = true
+eyre.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -11,9 +11,13 @@ exclude = [".github/"]
 members = [
     "bin/reth-bb/",
     "bin/reth/",
+    "bin/clique-reth/",
     "crates/storage/rpc-provider/",
     "crates/chain-state/",
     "crates/chainspec/",
+    "crates/clique-chainspec/",
+    "crates/clique-consensus/",
+    "crates/clique-node/",
     "crates/cli/cli/",
     "crates/cli/commands/",
     "crates/cli/runner/",
@@ -328,6 +332,10 @@ reth-codecs-derive = "0.8.2"
 reth-config = { path = "crates/config", default-features = false }
 reth-consensus = { path = "crates/consensus/consensus", default-features = false }
 reth-consensus-common = { path = "crates/consensus/common", default-features = false }
+# Clique PoA extension crates (thaichain)
+clique-consensus = { path = "crates/clique-consensus" }
+clique-chainspec = { path = "crates/clique-chainspec" }
+clique-node = { path = "crates/clique-node" }
 reth-consensus-debug-client = { path = "crates/consensus/debug-client" }
 reth-db = { path = "crates/storage/db", default-features = false }
 reth-db-api = { path = "crates/storage/db-api" }
@@ -507,6 +515,7 @@ rand = "0.9"
 rayon = "1.7"
 thread-priority = "3.0.0"
 rustc-hash = { version = "2.0", default-features = false }
+lru = "0.12.5"
 schnellru = "0.2"
 serde = { version = "1.0", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
