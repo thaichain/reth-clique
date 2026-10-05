@@ -1,0 +1,23 @@
+[package]
+name = "clique-reth"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Clique PoA reth node binary"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "clique-reth"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+clique-node.workspace = true
+alloy-signer-local.workspace = true
+reth-ethereum = { workspace = true, features = ["node", "cli"] }
+tokio.workspace = true
+
+eyre.workspace = true
+tracing.workspace = true

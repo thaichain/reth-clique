@@ -520,7 +520,7 @@ dependencies = [
  "futures",
  "futures-utils-wasm",
  "http",
- "lru",
+ "lru 0.18.2",
  "parking_lot",
  "pin-project",
  "reqwest",
@@ -2348,6 +2348,89 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "clique-chainspec"
+version = "0.1.0"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "clique-consensus",
+ "reth-chainspec",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "clique-consensus"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-signer",
+ "alloy-signer-local",
+ "lru 0.12.5",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-consensus-common",
+ "reth-ethereum-consensus",
+ "reth-execution-types",
+ "reth-primitives-traits",
+ "serde_json",
+]
+
+[[package]]
+name = "clique-node"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
+ "alloy-signer",
+ "alloy-signer-local",
+ "clap",
+ "clique-chainspec",
+ "clique-consensus",
+ "derive_more",
+ "eyre",
+ "futures",
+ "jsonrpsee",
+ "reth-chainspec",
+ "reth-cli",
+ "reth-engine-primitives",
+ "reth-ethereum",
+ "reth-ethereum-engine-primitives",
+ "reth-network",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-payload-builder",
+ "reth-payload-primitives",
+ "reth-primitives-traits",
+ "reth-rpc-server-types",
+ "reth-storage-errors",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "clique-reth"
+version = "0.1.0"
+dependencies = [
+ "alloy-signer-local",
+ "clap",
+ "clique-node",
+ "eyre",
+ "reth-ethereum",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cmake"
@@ -4535,6 +4618,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -5966,6 +6051,15 @@ dependencies = [
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
 ]
 
 [[package]]
@@ -7604,7 +7698,7 @@ dependencies = [
  "hashbrown 0.17.0",
  "itertools 0.14.0",
  "kasuari",
- "lru",
+ "lru 0.18.2",
  "palette",
  "serde",
  "strum 0.28.0",
