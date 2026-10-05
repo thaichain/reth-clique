@@ -17,15 +17,32 @@
 //!   scheduled).
 
 use alloy_consensus::Header;
+use alloy_rlp::Decodable as _;
 use alloy_eips::{Decodable2718 as _, Encodable2718 as _};
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_evm::{
+    eth::{EthEvmBuilder, EthEvmContext},
+    precompiles::{DynPrecompile, PrecompilesMap},
+    revm::{
+        context::{BlockEnv, CfgEnv, DBErrorMarker, TxEnv},
+        context_interface::result::{EVMError, HaltReason},
+        inspector::NoOpInspector,
+        precompile::{
+            PrecompileId, PrecompileOutput, PrecompileResult, PrecompileSpecId, PrecompileStatus,
+            Precompiles,
+        },
+        primitives::hardfork::SpecId,
+        Context, Inspector,
+    },
+    Database, EvmEnv, EvmFactory,
+};
+use alloy_primitives::{address, Address, B256, Bytes, U256};
 use reth_ethereum::{
     chainspec::{ChainSpec, EthChainSpec, EthereumHardfork, EthereumHardforks, ForkCondition},
     evm::{
         primitives::{
             eth::{spec::EthExecutorSpec, EthBlockExecutorFactory},
             ConfigureEvm, ConfigureEngineEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
-            EthEvmFactory, NextBlockEnvAttributes,
+            NextBlockEnvAttributes,
         },
         EthBlockAssembler, EthEvmConfig, RethReceiptBuilder,
     },
@@ -64,26 +81,144 @@ impl EthExecutorSpec for NoRewardSpec {
     }
 }
 
+/// Address of the `cliqueSealHash` precompile: `0x0000000000000000000000000000000000000c01`.
+///
+/// Input: the RLP encoding of a clique consensus header **including** the
+/// 65-byte signature tail in `extraData` (the on-chain form). Output: the
+/// 32-byte clique seal hash — feed it to the `ecrecover` precompile together
+/// with `(v, r, s)` from `extraData[64..]` to recover the block's signer.
+pub const CLIQUE_SEALHASH_ADDRESS: Address =
+    address!("0000000000000000000000000000000000000c01");
+
+/// Fixed gas cost of the `cliqueSealHash` precompile.
+const SEALHASH_GAS: u64 = 20_000;
+
+/// Returns a revert-style precompile output carrying `msg` as return data.
+fn precompile_revert(msg: String) -> PrecompileOutput {
+    PrecompileOutput {
+        status: PrecompileStatus::Revert,
+        gas_used: 0,
+        gas_refunded: 0,
+        state_gas_used: 0,
+        state_gas_spilled: 0,
+        reservoir: 0,
+        bytes: msg.as_bytes().to_vec().into(),
+    }
+}
+
+/// Computes the clique seal hash of an RLP-encoded header (see
+/// [`CLIQUE_SEALHASH_ADDRESS`]).
+pub fn clique_seal_hash(input: &[u8]) -> PrecompileResult {
+    // NOTE: `PrecompileResult::Err` is *fatal* in revm 43 — invalid input must
+    // be reported as a revert-status output instead.
+    let header = match Header::decode(&mut &input[..]) {
+        Ok(header) => header,
+        Err(err) => return Ok(precompile_revert(format!("invalid header RLP: {err}"))),
+    };
+    Ok(PrecompileOutput::new(
+        SEALHASH_GAS,
+        clique_consensus::seal::seal_hash(&header).0.to_vec().into(),
+        0,
+    ))
+}
+
+/// The clique extension precompiles, paired with their addresses.
+fn clique_precompiles() -> [(Address, DynPrecompile); 1] {
+    [(
+        CLIQUE_SEALHASH_ADDRESS,
+        DynPrecompile::new(PrecompileId::Custom("cliqueSealHash".into()), |input| {
+            clique_seal_hash(input.data)
+        }),
+    )]
+}
+
+/// EVM factory that injects the clique extension precompiles once the
+/// `cliquePrecompileTime` fork timestamp is reached (Tempo's
+/// `PrecompilesMap` pattern — no revm changes required).
+///
+/// The vanilla sets are always derived from the block's `SpecId`; the clique
+/// precompiles are *added on top*, so activation is purely additive.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CliqueEvmFactory {
+    /// Timestamp at which [`clique_precompiles`] activate. `None` = never.
+    precompile_time: Option<u64>,
+}
+
+impl CliqueEvmFactory {
+    /// Creates the factory with the given precompile activation timestamp.
+    pub const fn new(precompile_time: Option<u64>) -> Self {
+        Self { precompile_time }
+    }
+
+    /// Builds the precompile set for a block: the vanilla set for the block's
+    /// `SpecId`, extended with the clique precompiles if the fork is active.
+    fn precompiles_map(&self, spec: SpecId, timestamp: U256) -> PrecompilesMap {
+        let map =
+            PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec)));
+        if self.precompile_time.is_some_and(|fork_time| timestamp >= U256::from(fork_time)) {
+            map.with_extended_precompiles(clique_precompiles())
+        } else {
+            map
+        }
+    }
+}
+
+impl EvmFactory for CliqueEvmFactory {
+    type Evm<DB: Database, I: Inspector<EthEvmContext<DB>>> =
+        alloy_evm::eth::EthEvm<DB, I, PrecompilesMap>;
+    type Context<DB: Database> = Context<BlockEnv, TxEnv, CfgEnv<SpecId>, DB>;
+    type Tx = TxEnv;
+    type Error<DBError: DBErrorMarker> = EVMError<DBError>;
+    type HaltReason = HaltReason;
+    type Spec = SpecId;
+    type BlockEnv = BlockEnv;
+    type Precompiles = PrecompilesMap;
+
+    fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
+        let precompiles = self.precompiles_map(input.cfg_env.spec, input.block_env.timestamp);
+        EthEvmBuilder::new(db, input).precompiles(precompiles).build()
+    }
+
+    fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
+        &self,
+        db: DB,
+        input: EvmEnv,
+        inspector: I,
+    ) -> Self::Evm<DB, I> {
+        let precompiles = self.precompiles_map(input.cfg_env.spec, input.block_env.timestamp);
+        EthEvmBuilder::new(db, input)
+            .precompiles(precompiles)
+            .activate_inspector(inspector)
+            .build()
+    }
+}
+
 /// [`ConfigureEvm`](reth_ethereum::evm::primitives::ConfigureEvm) for a clique
-/// chain: vanilla Ethereum EVM with rewards disabled.
+/// chain: vanilla Ethereum EVM with rewards disabled and clique precompiles.
 #[derive(Clone)]
 pub struct CliqueEvmConfig {
-    /// Vanilla config used for EVM environment building (real spec).
-    inner: EthEvmConfig,
-    /// Executor factory carrying the no-reward spec.
-    executor_factory: EthBlockExecutorFactory<RethReceiptBuilder, NoRewardSpec, EthEvmFactory>,
+    /// Vanilla config used for EVM environment building (real spec), over the
+    /// clique EVM factory.
+    inner: EthEvmConfig<ChainSpec, CliqueEvmFactory>,
+    /// Executor factory carrying the no-reward spec and the clique factory.
+    executor_factory: EthBlockExecutorFactory<RethReceiptBuilder, NoRewardSpec, CliqueEvmFactory>,
     /// Vanilla block assembler (generic over the executor factory).
     assembler: EthBlockAssembler,
 }
 
 impl CliqueEvmConfig {
     /// Creates a new clique EVM config for the given chain spec.
-    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        let inner = EthEvmConfig::new(chain_spec.clone());
+    ///
+    /// `precompile_time` activates the clique extension precompiles from the
+    /// given unix timestamp on (see [`CLIQUE_SEALHASH_ADDRESS`]); `None`
+    /// disables them.
+    pub fn new(chain_spec: Arc<ChainSpec>, precompile_time: Option<u64>) -> Self {
+        let evm_factory = CliqueEvmFactory::new(precompile_time);
+        let inner = EthEvmConfig::new_with_evm_factory(chain_spec.clone(), evm_factory);
         let executor_factory = EthBlockExecutorFactory::new(
             RethReceiptBuilder::default(),
             NoRewardSpec(chain_spec.clone()),
-            EthEvmFactory::default(),
+            evm_factory,
         );
         Self {
             inner,
@@ -109,7 +244,7 @@ impl reth_ethereum::evm::primitives::ConfigureEvm for CliqueEvmConfig {
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
     type BlockExecutorFactory =
-        EthBlockExecutorFactory<RethReceiptBuilder, NoRewardSpec, EthEvmFactory>;
+        EthBlockExecutorFactory<RethReceiptBuilder, NoRewardSpec, CliqueEvmFactory>;
     type BlockAssembler = EthBlockAssembler;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
@@ -237,6 +372,91 @@ where
     type EVM = CliqueEvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(CliqueEvmConfig::new(ctx.chain_spec()))
+        // The precompile fork time rides along in the clique config registry
+        // (populated by the chain spec parser).
+        let chain_id = ctx.chain_spec().chain().id();
+        let precompile_time =
+            clique_chainspec::registered_clique_config(chain_id).and_then(|c| c.precompile_time);
+        Ok(CliqueEvmConfig::new(ctx.chain_spec(), precompile_time))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
+    use alloy_evm::revm::primitives::keccak256;
+
+    /// A signed test header whose seal hash we can verify against
+    /// `clique_consensus::seal_hash`.
+    fn signed_header() -> Header {
+        let mut header = Header {
+            parent_hash: keccak256("parent"),
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: Address::ZERO,
+            state_root: keccak256("state"),
+            transactions_root: keccak256("txs"),
+            receipts_root: keccak256("receipts"),
+            logs_bloom: Default::default(),
+            difficulty: alloy_primitives::U256::from(2),
+            number: 42,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp: 1_000,
+            extra_data: {
+                // vanity(32) + seal(65) with a dummy signature
+                let mut extra = vec![0u8; 32];
+                extra.extend_from_slice(&[0x42u8; 65]);
+                extra.into()
+            },
+            ..Default::default()
+        };
+        header.mix_hash = Default::default();
+        header.nonce = Default::default();
+        header
+    }
+
+    #[test]
+    fn seal_hash_precompile_matches_consensus() {
+        let header = signed_header();
+        let rlp = alloy_rlp::encode(&header);
+        let out = clique_seal_hash(&rlp).unwrap();
+        assert_eq!(out.status, PrecompileStatus::Success);
+        assert_eq!(out.gas_used, SEALHASH_GAS);
+        assert_eq!(out.bytes.as_ref(), clique_consensus::seal::seal_hash(&header).as_slice());
+        // deterministic
+        assert_eq!(clique_seal_hash(&rlp).unwrap().bytes, out.bytes);
+    }
+
+    #[test]
+    fn seal_hash_precompile_rejects_bad_input() {
+        // invalid RLP reverts (non-fatal) with the reason as return data
+        let out = clique_seal_hash(&[0xde, 0xad]).unwrap();
+        assert_eq!(out.status, PrecompileStatus::Revert);
+        assert!(!out.bytes.is_empty());
+
+        let empty = clique_seal_hash(&[]).unwrap();
+        assert_eq!(empty.status, PrecompileStatus::Revert);
+    }
+
+    #[test]
+    fn precompiles_activate_at_fork_time() {
+        let factory = CliqueEvmFactory::new(Some(1_000));
+
+        // before the fork: vanilla only
+        let pre = factory.precompiles_map(SpecId::OSAKA, U256::from(999));
+        assert!(pre.get(&CLIQUE_SEALHASH_ADDRESS).is_none());
+
+        // at/after the fork: clique precompile present
+        let post = factory.precompiles_map(SpecId::OSAKA, U256::from(1_000));
+        assert!(post.get(&CLIQUE_SEALHASH_ADDRESS).is_some());
+        // vanilla precompiles untouched
+        assert!(post
+            .get(&alloy_primitives::address!("0000000000000000000000000000000000000001"))
+            .is_some());
+
+        // fork never scheduled: never active
+        let never = CliqueEvmFactory::new(None).precompiles_map(SpecId::OSAKA, U256::MAX);
+        assert!(never.get(&CLIQUE_SEALHASH_ADDRESS).is_none());
     }
 }

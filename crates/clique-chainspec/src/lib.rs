@@ -71,7 +71,10 @@ pub fn clique_config_from_raw_config(
 ) -> Result<CliqueConfig, CliqueSpecError> {
     let value = config.get("clique").ok_or(CliqueSpecError::MissingClique)?;
     let raw: RawCliqueConfig = serde_json::from_value(value.clone())?;
-    Ok(CliqueConfig::new(raw.period, raw.epoch))
+    // Tempo-style extension fork: `"cliquePrecompileTime": <unix ts>` at the
+    // config root activates the clique extension precompiles.
+    let precompile_time = config.get("cliquePrecompileTime").and_then(|v| v.as_u64());
+    Ok(CliqueConfig::new(raw.period, raw.epoch).with_precompile_time(precompile_time))
 }
 
 /// Validates clique-specific genesis constraints (geth `core/genesis.go`).

@@ -57,13 +57,26 @@ pub struct CliqueConfig {
     pub period: u64,
     /// Number of blocks after which to checkpoint and reset pending votes.
     pub epoch: u64,
+    /// Timestamp at which the clique extension precompiles activate
+    /// (genesis config key `cliquePrecompileTime`). `None` = never.
+    pub precompile_time: Option<u64>,
 }
 
 impl CliqueConfig {
     /// Creates a config, normalizing `epoch == 0` to the default epoch length
     /// (mirrors geth `clique.New`).
     pub const fn new(period: u64, epoch: u64) -> Self {
-        Self { period, epoch: if epoch == 0 { DEFAULT_EPOCH_LENGTH } else { epoch } }
+        Self {
+            period,
+            epoch: if epoch == 0 { DEFAULT_EPOCH_LENGTH } else { epoch },
+            precompile_time: None,
+        }
+    }
+
+    /// Sets the clique precompile activation timestamp (builder style).
+    pub const fn with_precompile_time(mut self, precompile_time: Option<u64>) -> Self {
+        self.precompile_time = precompile_time;
+        self
     }
 
     /// Returns `true` if the given block number is an epoch checkpoint.
