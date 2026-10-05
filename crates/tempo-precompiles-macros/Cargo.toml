@@ -1,0 +1,20 @@
+[package]
+name = "tempo-precompiles-macros"
+description = "Procedural macros for type-safe EVM storage abstractions (vendored from tempoxyz/tempo)"
+
+version = "1.11.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+alloy.workspace = true

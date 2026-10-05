@@ -1,0 +1,84 @@
+[package]
+name = "tempo-primitives"
+description = "Tempo primitive types (vendored from tempoxyz/tempo)"
+
+version = "1.11.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tempo-contracts.workspace = true
+
+# revm
+revm = { workspace = true, optional = true }
+
+# Alloy
+alloy-consensus = { workspace = true, features = ["k256"] }
+alloy-evm = { workspace = true, optional = true }
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-serde = { workspace = true, optional = true }
+alloy-rpc-types-eth = { workspace = true, optional = true }
+alloy-network = { workspace = true, optional = true }
+
+# Utils
+derive_more.workspace = true
+modular-bitfield = { version = "0.13.1", optional = true }
+arbitrary = { version = "1.4", optional = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+once_cell.workspace = true
+
+# Cryptography
+base64.workspace = true
+commonware-cryptography.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
+sha2.workspace = true
+
+[dev-dependencies]
+alloy-primitives = { workspace = true, features = ["rand"] }
+alloy-signer.workspace = true
+alloy-sol-types.workspace = true
+alloy-signer-local.workspace = true
+commonware-cryptography = { workspace = true, features = ["arbitrary"] }
+
+[features]
+default = ["std", "serde"]
+std = [
+    "alloy-consensus/secp256k1",
+    "alloy-consensus/std",
+    "alloy-evm?/std",
+    "alloy-eips/std",
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "base64/std",
+    "commonware-cryptography/std",
+    "derive_more/std",
+    "once_cell/std",
+    "p256/std",
+    "revm?/std",
+    "revm?/blst",
+    "revm?/c-kzg",
+    "serde/std",
+    "serde_json/std",
+    "sha2/std",
+]
+serde = [
+    "dep:alloy-serde",
+    "alloy-consensus/serde",
+    "alloy-eips/serde",
+    "alloy-primitives/serde",
+    "base64/std",
+    "once_cell/alloc",
+    "p256/serde",
+    "tempo-contracts/serde",
+]
+evm = ["dep:alloy-evm", "dep:revm", "dep:modular-bitfield"]
+arbitrary = ["dep:arbitrary"]

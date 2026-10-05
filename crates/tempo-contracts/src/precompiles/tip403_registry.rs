@@ -1,0 +1,80 @@
+pub use ITIP403Registry::{
+    ITIP403RegistryErrors as TIP403RegistryError, ITIP403RegistryEvents as TIP403RegistryEvent,
+};
+
+crate::sol! {
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(abi)]
+    interface ITIP403Registry {
+        // Enums
+        enum PolicyType {
+            WHITELIST,
+            BLACKLIST,
+            COMPOUND
+        }
+
+        enum BlockedReason {
+            NONE,
+            TOKEN_FILTER,
+            RECEIVE_POLICY
+        }
+
+        // View Functions
+        function policyIdCounter() external view returns (uint64);
+        function policyExists(uint64 policyId) external view returns (bool);
+        function tokenTransferPolicyId(address token) external view returns (bool isSet, uint64 policyId);
+        function policyData(uint64 policyId) external view returns (PolicyType policyType, address admin);
+        function isAuthorized(uint64 policyId, address user) external view returns (bool);
+        function isAuthorizedSender(uint64 policyId, address user) external view returns (bool);
+        function isAuthorizedRecipient(uint64 policyId, address user) external view returns (bool);
+        function isAuthorizedMintRecipient(uint64 policyId, address user) external view returns (bool);
+        function compoundPolicyData(uint64 policyId) external view returns (uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId);
+        function receivePolicy(address account) external view returns (bool hasReceivePolicy, uint64 senderPolicyId, PolicyType senderPolicyType, uint64 tokenFilterId, PolicyType tokenFilterType, address recoveryAuthority);
+        function validateReceivePolicy(address token, address sender, address receiver) external view returns (bool authorized, BlockedReason blockedReason);
+
+        // State-Changing Functions
+        function createPolicy(address admin, PolicyType policyType) external returns (uint64);
+        function createPolicyWithAccounts(address admin, PolicyType policyType, address[] calldata accounts) external returns (uint64);
+        function setPolicyAdmin(uint64 policyId, address admin) external;
+        function modifyPolicyWhitelist(uint64 policyId, address account, bool allowed) external;
+        function modifyPolicyBlacklist(uint64 policyId, address account, bool restricted) external;
+        function createCompoundPolicy(uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId) external returns (uint64);
+        function setReceivePolicy(uint64 senderPolicyId, uint64 tokenFilterId, address recoveryAuthority) external;
+        function migrateTransferPolicyIds(address[] calldata tokens) external returns (uint256 migrated);
+
+        // Events
+        event PolicyAdminUpdated(uint64 indexed policyId, address indexed updater, address indexed admin);
+        event PolicyCreated(uint64 indexed policyId, address indexed updater, PolicyType policyType);
+        event WhitelistUpdated(uint64 indexed policyId, address indexed updater, address indexed account, bool allowed);
+        event BlacklistUpdated(uint64 indexed policyId, address indexed updater, address indexed account, bool restricted);
+        event CompoundPolicyCreated(uint64 indexed policyId, address indexed creator, uint64 senderPolicyId, uint64 recipientPolicyId, uint64 mintRecipientPolicyId);
+        event ReceivePolicyUpdated(address indexed account, uint64 senderPolicyId, uint64 tokenFilterId, address recoveryAuthority);
+
+        // Errors
+        error Unauthorized();
+        error PolicyNotFound();
+        error PolicyNotSimple();
+        error InvalidPolicyType();
+        error IncompatiblePolicyType();
+        error VirtualAddressNotAllowed();
+        error InvalidReceivePolicyType();
+        error InvalidRecoveryAuthority();
+    }
+}
+
+impl ITIP403Registry::PolicyType {
+    /// Returns `true` if this is a whitelist policy.
+    pub const fn is_whitelist(&self) -> bool {
+        matches!(self, Self::WHITELIST)
+    }
+
+    /// Returns `true` if this is a blacklist policy.
+    pub const fn is_blacklist(&self) -> bool {
+        matches!(self, Self::BLACKLIST)
+    }
+
+    /// Returns `true` if this is a compound policy.
+    pub const fn is_compound(&self) -> bool {
+        matches!(self, Self::COMPOUND)
+    }
+}

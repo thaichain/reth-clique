@@ -1,0 +1,28 @@
+[package]
+name = "tempo-contracts"
+description = "Tempo blockchain contract bindings and ABI definitions (vendored from tempoxyz/tempo)"
+
+version = "1.11.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+alloy-sol-types = { workspace = true, features = ["json"] }
+serde = { workspace = true, optional = true }
+tempo-hardfork.workspace = true
+
+[dev-dependencies]
+alloy-primitives = { workspace = true, features = ["rand"] }
+
+[features]
+default = ["std", "serde"]
+rpc = []
+std = ["alloy-primitives/std", "alloy-sol-types/std", "serde?/std", "tempo-hardfork/std"]
+serde = ["dep:serde", "alloy-primitives/serde", "tempo-hardfork/serde"]

@@ -18,6 +18,12 @@ members = [
     "crates/clique-chainspec/",
     "crates/clique-consensus/",
     "crates/clique-node/",
+    "crates/tempo-chainspec/",
+    "crates/tempo-contracts/",
+    "crates/tempo-hardfork/",
+    "crates/tempo-precompiles/",
+    "crates/tempo-precompiles-macros/",
+    "crates/tempo-primitives/",
     "crates/cli/cli/",
     "crates/cli/commands/",
     "crates/cli/runner/",
@@ -336,6 +342,24 @@ reth-consensus-common = { path = "crates/consensus/common", default-features = f
 clique-consensus = { path = "crates/clique-consensus" }
 clique-chainspec = { path = "crates/clique-chainspec" }
 clique-node = { path = "crates/clique-node" }
+# Tempo precompile stack (vendored from tempoxyz/tempo, Apache-2.0/MIT)
+tempo-hardfork = { path = "crates/tempo-hardfork" }
+tempo-contracts = { path = "crates/tempo-contracts", default-features = false }
+tempo-precompiles-macros = { path = "crates/tempo-precompiles-macros" }
+tempo-primitives = { path = "crates/tempo-primitives", default-features = false }
+tempo-chainspec = { path = "crates/tempo-chainspec", default-features = false }
+tempo-precompiles = { path = "crates/tempo-precompiles" }
+alloy = { version = "2.5.0", default-features = false }
+alloy-json-abi = { version = "1.7.3", default-features = false }
+keccak-const = "0.2.0"
+scoped-tls = "1.0"
+commonware-codec = "2026.9.0"
+commonware-cryptography = { version = "2026.9.0", default-features = false }
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+base64 = { version = "0.22", features = ["alloc"], default-features = false }
+p256 = { version = "0.13", default-features = false }
 reth-consensus-debug-client = { path = "crates/consensus/debug-client" }
 reth-db = { path = "crates/storage/db", default-features = false }
 reth-db-api = { path = "crates/storage/db-api" }
@@ -435,14 +459,14 @@ reth-trie-sparse = { path = "crates/trie/sparse", default-features = false }
 reth-zstd-compressors = { version = "0.8.2", default-features = false }
 
 # revm
-revm = { version = "43.0.3", default-features = false }
+revm = { version = "43.0.3", default-features = false, features = ["optional_fee_charge"] }
 revmc = { git = "https://github.com/paradigmxyz/revmc", branch = "main", default-features = false, features = ["llvm-prefer-static"] }
 revm-inspectors = "0.44.1"
 
 # eth
 alloy-dyn-abi = "1.6.1"
 alloy-primitives = { version = "1.6.1", default-features = false, features = ["map-foldhash"] }
-alloy-sol-types = { version = "1.6.1", default-features = false }
+alloy-sol-types = { version = "1.7.3", default-features = false }
 
 alloy-chains = { version = "0.2.33", default-features = false }
 alloy-eip2124 = { version = "0.2.0", default-features = false }
@@ -517,7 +541,7 @@ thread-priority = "3.0.0"
 rustc-hash = { version = "2.0", default-features = false }
 lru = "0.12.5"
 schnellru = "0.2"
-serde = { version = "1.0", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 serde_with = { version = "3", default-features = false, features = ["macros"] }
 sha2 = { version = "0.10", default-features = false }

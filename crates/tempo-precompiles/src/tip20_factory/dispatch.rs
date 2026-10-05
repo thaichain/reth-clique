@@ -1,0 +1,29 @@
+//! ABI dispatch for the [`TIP20Factory`] precompile.
+
+use crate::{Precompile, charge_input_cost, dispatch, mutate, tip20_factory::TIP20Factory, view};
+use alloy::primitives::Address;
+use revm::precompile::PrecompileResult;
+use tempo_contracts::precompiles::ITIP20Factory;
+
+impl Precompile for TIP20Factory {
+    fn call(&mut self, calldata: &[u8], msg_sender: Address) -> PrecompileResult {
+        if let Some(err) = charge_input_cost(&mut self.storage, calldata) {
+            return err;
+        }
+
+        dispatch!(
+            calldata,
+            |call| match call {
+                ITIP20Factory::ITIP20FactoryCalls {
+                    createToken_0(call) => mutate(call, msg_sender, |sender, c| self.create_token(sender, c)),
+                    #[schedule(since = T5)]
+                    createToken_1(call) => mutate(call, msg_sender, |sender, c| self.create_token_with_logo(sender, c)),
+                    isTIP20(call) => view(call, |c| self.is_tip20(c.token)),
+                    getTokenAddress(call) => view(call, |c| self.get_token_address(c)),
+                }
+            },
+        )
+    }
+}
+
+

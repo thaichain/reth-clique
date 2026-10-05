@@ -1,0 +1,1576 @@
+//! Orderbook and tick level management for the stablecoin DEX.
+
+use crate::{
+    error::{Result, TempoPrecompileError},
+    stablecoin_dex::{IStablecoinDEX, Order, TICK_SPACING},
+    storage::{Handler, Mapping, StorageCtx},
+};
+use alloy::primitives::{Address, B256, U256, keccak256};
+use std::ops::Deref;
+use tempo_contracts::precompiles::StablecoinDEXError;
+use tempo_precompiles_macros::Storable;
+
+/// Minimum allowed tick value (corresponds to `MIN_PRICE`).
+pub const MIN_TICK: i16 = -2000;
+/// Maximum allowed tick value (corresponds to `MAX_PRICE`).
+pub const MAX_TICK: i16 = 2000;
+/// Scaling factor for tick-to-price conversion. A tick of 0 maps to `PRICE_SCALE` (peg).
+pub const PRICE_SCALE: u32 = 100_000;
+
+/// Rounding direction for price conversions.
+///
+/// Rounding prevents dust-level insolvency in maker/taker settlement:
+/// - When escrowing funds from a user → round UP (user pays more)
+/// - When releasing funds to a user → round DOWN (user receives less)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundingDirection {
+    /// Round down (floor division) - favors protocol when user receives funds
+    Down,
+    /// Round up (ceiling division) - favors protocol when user deposits funds
+    Up,
+}
+
+/// Per-order result of stepping a trade across one resting order. Shared by the
+/// swap settlement and the per-order quote so both walk the book identically.
+pub struct OrderStep {
+    /// Base amount filled from this order (`<= order.remaining()`). A value
+    /// strictly below `remaining` means this order terminates the trade.
+    pub fill_amount: u128,
+    /// Amount accumulated into the running total for this fill: taker output for
+    /// exact-in trades, taker input for exact-out trades.
+    pub accumulate: u128,
+    /// Input (exact-in) or output (exact-out) left after fully consuming this
+    /// order. Only meaningful on a full fill.
+    pub next_amount: u128,
+}
+
+/// How the current resting order is consumed by [`walk_resting_orders`].
+pub(crate) enum Fill {
+    /// The order terminates the trade; `u128` is the base amount filled.
+    Partial(u128),
+    /// The order is fully consumed and the walk continues to the next order.
+    Full,
+}
+
+/// Walks resting orders starting at `order`, applying the pure per-order
+/// arithmetic `step` and delegating settlement and advancement to `settle`,
+/// until `amount` (input for exact-in, output for exact-out) is exhausted.
+/// Returns the running total (output for exact-in, input for exact-out).
+///
+/// This is the single traversal shared by swap execution and quotes: the swap
+/// passes a mutating `settle` that fills orders and returns the next one, while
+/// the quote passes a read-only `settle` that only advances the cursor, so both
+/// price a trade identically.
+pub(crate) fn walk_resting_orders(
+    mut order: Order,
+    mut amount: u128,
+    is_bid: bool,
+    step: impl Fn(u128, &Order, bool) -> Option<OrderStep>,
+    mut settle: impl FnMut(Order, Fill) -> Result<Option<Order>>,
+) -> Result<u128> {
+    let mut total: u128 = 0;
+
+    while amount > 0 {
+        let remaining = order.remaining();
+        let s = step(amount, &order, is_bid).ok_or(TempoPrecompileError::under_overflow())?;
+        // Preserve historical settlement-before-overflow ordering for replay gas.
+        if s.fill_amount < remaining {
+            // Partial fill terminates the trade.
+            settle(order, Fill::Partial(s.fill_amount))?;
+            total = total
+                .checked_add(s.accumulate)
+                .ok_or(TempoPrecompileError::under_overflow())?;
+            break;
+        }
+
+        let next = settle(order, Fill::Full)?;
+        total = total
+            .checked_add(s.accumulate)
+            .ok_or(TempoPrecompileError::under_overflow())?;
+        match next {
+            Some(next) => order = next,
+            None => {
+                if s.next_amount > 0 {
+                    return Err(StablecoinDEXError::insufficient_liquidity().into());
+                }
+                break;
+            }
+        }
+        amount = s.next_amount;
+    }
+
+    Ok(total)
+}
+
+/// Convert base token amount to quote token amount at a given tick.
+///
+/// Formula: quote_amount = (base_amount * price) / PRICE_SCALE
+///
+/// Uses U256 for intermediate multiplication to prevent overflow.
+///
+/// # Arguments
+/// * `base_amount` - Amount of base tokens
+/// * `tick` - Price tick
+/// * `rounding` - Rounding direction
+///
+/// # Returns
+/// Quote token amount, or None if result exceeds u128
+pub fn base_to_quote(base_amount: u128, tick: i16, rounding: RoundingDirection) -> Option<u128> {
+    let price = U256::from(tick_to_price(tick));
+    let base = U256::from(base_amount);
+    let scale = U256::from(PRICE_SCALE);
+
+    let numerator = base * price;
+
+    let result = match rounding {
+        RoundingDirection::Down => numerator / scale,
+        RoundingDirection::Up => numerator.div_ceil(scale),
+    };
+
+    result.try_into().ok()
+}
+
+/// Convert quote token amount to base token amount at a given tick.
+///
+/// Formula: base_amount = (quote_amount * PRICE_SCALE) / price
+///
+/// Uses U256 for intermediate multiplication to prevent overflow.
+///
+/// # Arguments
+/// * `quote_amount` - Amount of quote tokens
+/// * `tick` - Price tick
+/// * `rounding` - Rounding direction
+///
+/// # Returns
+/// Base token amount, or None if result exceeds u128
+pub fn quote_to_base(quote_amount: u128, tick: i16, rounding: RoundingDirection) -> Option<u128> {
+    let price = U256::from(tick_to_price(tick));
+    let quote = U256::from(quote_amount);
+    let scale = U256::from(PRICE_SCALE);
+
+    let numerator = quote * scale;
+
+    let result = match rounding {
+        RoundingDirection::Down => numerator / price,
+        RoundingDirection::Up => numerator.div_ceil(price),
+    };
+
+    result.try_into().ok()
+}
+
+/// Amount the taker receives for filling `fill_amount` base of a resting order
+/// (zero-sum with the maker): selling base into a bid yields quote rounded down,
+/// buying base from an ask yields the base amount exactly.
+///
+/// Used by the shared per-order step arithmetic so quote and swap compute the
+/// taker output identically.
+pub fn taker_output(fill_amount: u128, tick: i16, is_bid: bool) -> Option<u128> {
+    if is_bid {
+        base_to_quote(fill_amount, tick, RoundingDirection::Down)
+    } else {
+        Some(fill_amount)
+    }
+}
+
+/// Per-order arithmetic for an exact-input trade. Pure: depends only on the
+/// order's `remaining`, `tick`, and side. The caller compares `fill_amount`
+/// against `remaining` to decide whether the order is partially or fully consumed.
+///
+/// NOTE: Fill arithmetic uses the route's `is_bid`, while taker payout uses `order.is_bid()`.
+/// They are equal for valid books, but can differ in some Moderato testnet DEX books whose
+/// corrupted linked lists contain dangling pointers to missing order state ("ghost orders").
+pub fn step_exact_in(amount_in: u128, order: &Order, is_bid: bool) -> Option<OrderStep> {
+    let (remaining, tick) = (order.remaining(), order.tick());
+    let (fill_amount, next_amount) = if is_bid {
+        // Selling base: input is base, fill in base.
+        (
+            amount_in.min(remaining),
+            amount_in.saturating_sub(remaining),
+        )
+    } else {
+        // Buying base: input is quote, convert to base (round down, favors protocol).
+        let base_out = quote_to_base(amount_in, tick, RoundingDirection::Down)?;
+        let next_amount = if base_out > remaining {
+            // Quote consumed = what the maker receives, rounded up (zero-sum with maker).
+            let quote_needed = base_to_quote(remaining, tick, RoundingDirection::Up)?;
+            amount_in.checked_sub(quote_needed)?
+        } else {
+            0
+        };
+        (base_out.min(remaining), next_amount)
+    };
+
+    Some(OrderStep {
+        fill_amount,
+        accumulate: taker_output(fill_amount, tick, order.is_bid())?,
+        next_amount,
+    })
+}
+
+/// Per-order arithmetic for an exact-output trade. Pure: depends only on the
+/// order's `remaining`, `tick`, and side.
+///
+/// NOTE: Output carried after a full fill uses `order.is_bid()` for the same
+/// Moderato compatibility reasons described in [`step_exact_in`].
+pub fn step_exact_out(amount_out: u128, order: &Order, is_bid: bool) -> Option<OrderStep> {
+    let (remaining, tick) = (order.remaining(), order.tick());
+    let (fill_amount, accumulate, demand) = if is_bid {
+        // Receiving quote: round up the base needed to cover the exact output.
+        let base_needed = quote_to_base(amount_out, tick, RoundingDirection::Up)?;
+        let fill_amount = base_needed.min(remaining);
+        (fill_amount, fill_amount, base_needed)
+    } else {
+        // Receiving base: input is quote the maker receives, rounded up (zero-sum).
+        let fill_amount = amount_out.min(remaining);
+        let amount_in = base_to_quote(fill_amount, tick, RoundingDirection::Up)?;
+        (fill_amount, amount_in, amount_out)
+    };
+
+    // The trade carries over only when demand strictly exceeds this order: for a
+    // bid that is the base needed to cover the output, for an ask the output
+    // itself. The carried amount is the output still owed after this full fill.
+    let next_amount = if demand > remaining {
+        let amount_out_received = taker_output(remaining, tick, order.is_bid())?;
+        amount_out.checked_sub(amount_out_received)?
+    } else {
+        0
+    };
+
+    Some(OrderStep {
+        fill_amount,
+        accumulate,
+        next_amount,
+    })
+}
+
+/// Lowest representable scaled price (`PRICE_SCALE + MIN_TICK`).
+pub(crate) const MIN_PRICE: u32 = 98_000;
+/// Highest representable scaled price (`PRICE_SCALE + MAX_TICK`).
+pub(crate) const MAX_PRICE: u32 = 102_000;
+
+/// The packed linked-list fields in the first storage slot of [`TickLevel`].
+#[derive(Debug, Storable, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TickLevelLinks {
+    /// Order ID of the first order at this tick (0 if empty).
+    pub head: u128,
+    /// Order ID of the last order at this tick (0 if empty).
+    pub tail: u128,
+}
+
+/// Represents a price level in the orderbook with a doubly-linked list of orders
+/// Orders are maintained in FIFO order at each tick level
+#[derive(Debug, Storable, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TickLevel {
+    /// Live order links packed into the first storage slot.
+    pub links: TickLevelLinks,
+    /// Total liquidity available at this tick level
+    pub total_liquidity: u128,
+}
+
+/// 1-based ID assigned to an orderbook's `book_keys` vector index; zero means unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BookId(u32);
+
+impl BookId {
+    pub(crate) const UNSET: Self = Self(0);
+
+    pub(crate) fn from_index(index: u32) -> Self {
+        Self(index + 1)
+    }
+
+    /// Returns the zero-based `book_keys` vector index, if this ID is set.
+    pub(crate) fn index(self) -> Option<u32> {
+        self.0.checked_sub(1)
+    }
+}
+
+impl From<u32> for BookId {
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl Deref for BookId {
+    type Target = u32;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl TickLevel {
+    /// Creates a new empty tick level
+    pub fn new() -> Self {
+        Self {
+            links: TickLevelLinks::default(),
+            total_liquidity: 0,
+        }
+    }
+
+    /// Creates a tick level with specific values
+    pub fn with_values(head: u128, tail: u128, total_liquidity: u128) -> Self {
+        Self {
+            links: TickLevelLinks { head, tail },
+            total_liquidity,
+        }
+    }
+
+    /// Returns true if this tick level has no orders
+    pub fn is_empty(&self) -> bool {
+        self.links.head == 0 && self.links.tail == 0
+    }
+
+    /// Returns true if this tick level has orders
+    pub fn has_liquidity(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+// `Storable` also generates `Handler<TickLevel>` for raw two-slot access. These
+// inherent methods intentionally take precedence at call sites so normal T12 access
+// uses only `links`; tests use UFCS when they need to inspect the stale aggregate.
+impl TickLevelHandler {
+    /// Reads only the live linked-list slot at T12 while preserving the legacy layout below T12.
+    #[inline]
+    pub(crate) fn read(&self) -> Result<TickLevel> {
+        if StorageCtx.spec().is_t12() {
+            Ok(TickLevel {
+                links: self.links.read()?,
+                total_liquidity: 0,
+            })
+        } else {
+            <Self as Handler<TickLevel>>::read(self)
+        }
+    }
+
+    /// Writes only the live linked-list slot at T12 while preserving the legacy layout below T12.
+    #[inline]
+    pub(crate) fn write(&mut self, level: TickLevel) -> Result<()> {
+        if StorageCtx.spec().is_t12() {
+            self.links.write(level.links)
+        } else {
+            <Self as Handler<TickLevel>>::write(self, level)
+        }
+    }
+
+    /// Deletes only the live linked-list slot at T12 while preserving the stale aggregate.
+    #[inline]
+    pub(crate) fn delete(&mut self) -> Result<()> {
+        if StorageCtx.spec().is_t12() {
+            self.links.delete()
+        } else {
+            <Self as Handler<TickLevel>>::delete(self)
+        }
+    }
+}
+
+impl From<TickLevel> for IStablecoinDEX::PriceLevel {
+    fn from(value: TickLevel) -> Self {
+        Self {
+            head: value.links.head,
+            tail: value.links.tail,
+            totalLiquidity: value.total_liquidity,
+        }
+    }
+}
+
+/// Orderbook for token pair with price-time priority
+/// Uses tick-based pricing with bitmaps for price discovery
+#[derive(Storable)]
+pub struct Orderbook {
+    /// Base token address
+    pub base: Address,
+    /// Quote token address
+    pub quote: Address,
+    /// Bid orders by tick
+    #[expect(dead_code)]
+    bids: Mapping<i16, TickLevel>,
+    /// Ask orders by tick
+    #[expect(dead_code)]
+    asks: Mapping<i16, TickLevel>,
+    /// Best bid tick for highest bid price.
+    pub(crate) best_bid_tick: i16,
+    /// Best ask tick for lowest ask price.
+    pub(crate) best_ask_tick: i16,
+    /// (+T8) 1-based book ID; zero means unset.
+    pub(crate) book_id: u32,
+    #[expect(dead_code)]
+    /// Mapping of tick index to bid bitmap for price discovery
+    bid_bitmap: Mapping<i16, U256>,
+    /// Mapping of tick index to ask bitmap for price discovery
+    #[expect(dead_code)]
+    ask_bitmap: Mapping<i16, U256>,
+}
+
+impl Orderbook {
+    /// Creates a new orderbook for a token pair
+    pub fn new(base: Address, quote: Address) -> Self {
+        Self {
+            base,
+            quote,
+            best_bid_tick: i16::MIN,
+            best_ask_tick: i16::MAX,
+            book_id: *BookId::UNSET,
+            bids: Mapping::default(),
+            asks: Mapping::default(),
+            bid_bitmap: Mapping::default(),
+            ask_bitmap: Mapping::default(),
+        }
+    }
+
+    /// Creates a new orderbook with its zero-based `book_keys` vector index.
+    pub fn new_with_index(base: Address, quote: Address, index: u32) -> Self {
+        let id = BookId::from_index(index);
+        Self {
+            book_id: *id,
+            ..Self::new(base, quote)
+        }
+    }
+
+    /// Returns this orderbook's 1-based book ID.
+    pub(crate) fn id(&self) -> BookId {
+        BookId::from(self.book_id)
+    }
+
+    /// Returns true if this orderbook is initialized
+    pub fn is_initialized(&self) -> bool {
+        self.base != Address::ZERO
+    }
+
+    /// Returns true if the base and quote tokens match the provided base and quote token options.
+    pub fn matches_tokens(
+        &self,
+        base_token: Option<Address>,
+        quote_token: Option<Address>,
+    ) -> bool {
+        // Check base token filter
+        if let Some(base) = base_token
+            && base != self.base
+        {
+            return false;
+        }
+
+        // Check quote token filter
+        if let Some(quote) = quote_token
+            && quote != self.quote
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+impl OrderbookHandler {
+    /// Returns a reference to the tick level handler for the given tick and side.
+    pub fn tick_level_handler(&self, tick: i16, is_bid: bool) -> &TickLevelHandler {
+        if is_bid {
+            &self.bids[tick]
+        } else {
+            &self.asks[tick]
+        }
+    }
+
+    /// Returns a mutable reference to the tick level handler for the given tick and side.
+    pub fn tick_level_handler_mut(&mut self, tick: i16, is_bid: bool) -> &mut TickLevelHandler {
+        if is_bid {
+            &mut self.bids[tick]
+        } else {
+            &mut self.asks[tick]
+        }
+    }
+
+    fn calc_tick_word_idx(&self, tick: i16) -> Result<i16> {
+        if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+            return Err(StablecoinDEXError::invalid_tick().into());
+        }
+
+        Ok(tick >> 8)
+    }
+
+    /// Sets the bitmap bit for `tick` to mark it as active on the given side.
+    ///
+    /// # Errors
+    /// - `InvalidTick` — tick is outside `[MIN_TICK, MAX_TICK]`
+    pub fn set_tick_bit(&mut self, tick: i16, is_bid: bool) -> Result<()> {
+        let word_index = self.calc_tick_word_idx(tick)?;
+        let bitmap = if is_bid {
+            &mut self.bid_bitmap[word_index]
+        } else {
+            &mut self.ask_bitmap[word_index]
+        };
+
+        // Read current bitmap word
+        let current_word = bitmap.read()?;
+
+        // Use bitwise AND to get lower 8 bits correctly for both positive and negative ticks
+        let bit_index = (tick & 0xFF) as usize;
+        let mask = U256::from(1u8) << bit_index;
+
+        // Set the bit
+        bitmap.write(current_word | mask)
+    }
+
+    /// Clears the bitmap bit for `tick` to mark it as inactive on the given side.
+    ///
+    /// # Errors
+    /// - `InvalidTick` — tick is outside `[MIN_TICK, MAX_TICK]`
+    pub fn delete_tick_bit(&mut self, tick: i16, is_bid: bool) -> Result<()> {
+        let word_index = self.calc_tick_word_idx(tick)?;
+        let bitmap = if is_bid {
+            &mut self.bid_bitmap[word_index]
+        } else {
+            &mut self.ask_bitmap[word_index]
+        };
+
+        // Read current bitmap word
+        let current_word = bitmap.read()?;
+
+        // Use bitwise AND to get lower 8 bits correctly for both positive and negative ticks
+        let bit_index = (tick & 0xFF) as usize;
+        let mask = !(U256::from(1u8) << bit_index);
+
+        // Set the bit
+        bitmap.write(current_word & mask)
+    }
+
+    /// Returns `true` if the given `tick` has active orders on the specified side.
+    ///
+    /// # Errors
+    /// - `InvalidTick` — tick is outside `[MIN_TICK, MAX_TICK]`
+    pub fn is_tick_initialized(&self, tick: i16, is_bid: bool) -> Result<bool> {
+        let word_index = self.calc_tick_word_idx(tick)?;
+        let bitmap = if is_bid {
+            &self.bid_bitmap[word_index]
+        } else {
+            &self.ask_bitmap[word_index]
+        };
+
+        // Read current bitmap word
+        let word = bitmap.read()?;
+
+        // Use bitwise AND to get lower 8 bits correctly for both positive and negative ticks
+        let bit_index = (tick & 0xFF) as usize;
+        let mask = U256::from(1u8) << bit_index;
+
+        Ok((word & mask) != U256::ZERO)
+    }
+
+    /// Finds the next initialized tick with liquidity. Searches downward for bids, upward for asks.
+    pub fn next_initialized_tick(&self, tick: i16, is_bid: bool) -> Result<(i16, bool)> {
+        if is_bid {
+            self.next_initialized_bid_tick(tick)
+        } else {
+            self.next_initialized_ask_tick(tick)
+        }
+    }
+
+    /// Find next initialized ask tick higher than current tick.
+    ///
+    /// Uses efficient bitmap word traversal: reads entire 256-bit words and uses
+    /// bit manipulation to find set bits, minimizing storage reads.
+    fn next_initialized_ask_tick(&self, tick: i16) -> Result<(i16, bool)> {
+        // Guard against overflow when tick is at or above MAX_TICK
+        if tick >= MAX_TICK {
+            return Ok((MAX_TICK, false));
+        }
+
+        let mut next_tick = tick + 1;
+        let max_word_index = MAX_TICK >> 8;
+
+        loop {
+            let word_index = next_tick >> 8;
+            if word_index > max_word_index {
+                return Ok((next_tick, false));
+            }
+
+            let bit_index = (next_tick & 0xFF) as usize;
+
+            let word = self.ask_bitmap[word_index].read()?;
+
+            // Mask off bits below bit_index to only consider ticks >= next_tick
+            let mask = if bit_index == 0 {
+                U256::MAX
+            } else {
+                U256::MAX << bit_index
+            };
+            let masked_word = word & mask;
+
+            if masked_word != U256::ZERO {
+                // Find the lowest set bit position using trailing_zeros
+                let lowest_bit = masked_word.trailing_zeros();
+                let found_tick = (word_index << 8) | (lowest_bit as i16);
+                if found_tick <= MAX_TICK {
+                    return Ok((found_tick, true));
+                }
+                return Ok((found_tick, false));
+            }
+
+            // No set bits in this word, move to next word
+            let next_word_index = word_index + 1;
+            if next_word_index > max_word_index {
+                return Ok((next_word_index << 8, false));
+            }
+            next_tick = next_word_index << 8; // First tick of next word
+        }
+    }
+
+    /// Find next initialized bid tick lower than current tick.
+    ///
+    /// Uses efficient bitmap word traversal: reads entire 256-bit words and uses
+    /// bit manipulation to find set bits, minimizing storage reads.
+    fn next_initialized_bid_tick(&self, tick: i16) -> Result<(i16, bool)> {
+        // Guard against underflow when tick is at or below MIN_TICK
+        if tick <= MIN_TICK {
+            return Ok((MIN_TICK, false));
+        }
+
+        let mut next_tick = tick - 1;
+        let min_word_index = MIN_TICK >> 8;
+
+        loop {
+            let word_index = next_tick >> 8;
+            if word_index < min_word_index {
+                return Ok((next_tick, false));
+            }
+
+            let bit_index = (next_tick & 0xFF) as usize;
+
+            let word = self.bid_bitmap[word_index].read()?;
+
+            // Mask off bits above bit_index to only consider ticks <= next_tick
+            let mask = if bit_index == 255 {
+                U256::MAX
+            } else {
+                U256::MAX >> (255 - bit_index)
+            };
+            let masked_word = word & mask;
+
+            if masked_word != U256::ZERO {
+                // Find the highest set bit position using leading_zeros
+                // U256 is 256 bits, so highest bit index = 255 - leading_zeros
+                let leading = masked_word.leading_zeros();
+                let highest_bit = 255 - leading;
+                let found_tick = (word_index << 8) | (highest_bit as i16);
+                if found_tick >= MIN_TICK {
+                    return Ok((found_tick, true));
+                }
+                return Ok((found_tick, false));
+            }
+
+            // No set bits in this word, move to previous word
+            let prev_word_index = word_index - 1;
+            if prev_word_index < min_word_index {
+                return Ok(((prev_word_index << 8) | 0xFF, false));
+            }
+            next_tick = (prev_word_index << 8) | 0xFF; // Last tick of previous word
+        }
+    }
+}
+
+impl From<Orderbook> for IStablecoinDEX::Orderbook {
+    fn from(value: Orderbook) -> Self {
+        Self {
+            base: value.base,
+            quote: value.quote,
+            bestBidTick: value.best_bid_tick,
+            bestAskTick: value.best_ask_tick,
+        }
+    }
+}
+
+/// Compute deterministic book key from ordered (base, quote) token pair
+pub fn compute_book_key(base: Address, quote: Address) -> B256 {
+    // Compute keccak256(abi.encodePacked(base, quote))
+    let mut buf = [0u8; 40];
+    buf[..20].copy_from_slice(base.as_slice());
+    buf[20..].copy_from_slice(quote.as_slice());
+    keccak256(buf)
+}
+
+/// Convert relative tick to scaled price
+pub fn tick_to_price(tick: i16) -> u32 {
+    (PRICE_SCALE as i32 + i32::from(tick)) as u32
+}
+
+/// Converts a scaled price back to a relative tick.
+///
+/// # Errors
+/// - `TickOutOfBounds` — price is outside `[MIN_PRICE, MAX_PRICE]`
+pub fn price_to_tick(price: u32) -> Result<i16> {
+    if !(MIN_PRICE..=MAX_PRICE).contains(&price) {
+        let invalid_tick = (price as i32 - PRICE_SCALE as i32) as i16;
+        return Err(StablecoinDEXError::tick_out_of_bounds(invalid_tick).into());
+    }
+    Ok((price as i32 - PRICE_SCALE as i32) as i16)
+}
+
+/// Validates that a tick is aligned to [`TICK_SPACING`].
+///
+/// # Errors
+/// - `InvalidTick` — tick is not a multiple of [`TICK_SPACING`]
+pub fn validate_tick_spacing(tick: i16) -> Result<()> {
+    if tick % TICK_SPACING != 0 {
+        return Err(StablecoinDEXError::invalid_tick().into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        error::TempoPrecompileError,
+        storage::{StorageCtx, hashmap::HashMapStorageProvider},
+    };
+    use rand_08::Rng;
+    use tempo_chainspec::hardfork::TempoHardfork;
+
+    use alloy::primitives::address;
+
+    #[test]
+    fn test_walk_settles_before_accumulation_overflow() {
+        for second_remaining in [2, 3] {
+            let mut first = Order::new_ask(1, Address::ZERO, B256::ZERO, 1, 0);
+            first.next = 2;
+            let mut second = Order::new_ask(2, Address::ZERO, B256::ZERO, second_remaining, 0);
+            second.prev = 1;
+            let mut settled = Vec::new();
+
+            let result = walk_resting_orders(
+                first,
+                3,
+                false,
+                |amount, order, _| {
+                    let remaining = order.remaining();
+                    Some(OrderStep {
+                        fill_amount: amount.min(remaining),
+                        accumulate: if remaining == 1 { u128::MAX } else { 1 },
+                        next_amount: amount.saturating_sub(remaining),
+                    })
+                },
+                |order, fill| {
+                    settled.push(order.order_id());
+                    match (order.order_id(), fill) {
+                        (1, Fill::Full) => Ok(Some(second)),
+                        (2, Fill::Full | Fill::Partial(_)) => Ok(None),
+                        _ => unreachable!(),
+                    }
+                },
+            );
+
+            assert_eq!(result.unwrap_err(), TempoPrecompileError::under_overflow());
+            assert_eq!(settled, [1, 2]);
+        }
+    }
+
+    #[test]
+    fn test_tick_level_creation() {
+        let level = TickLevel::new();
+        assert_eq!(level.links.head, 0);
+        assert_eq!(level.links.tail, 0);
+        assert_eq!(level.total_liquidity, 0);
+        assert!(level.is_empty());
+        assert!(!level.has_liquidity());
+    }
+
+    #[test]
+    fn test_tick_level_handler_io() -> eyre::Result<()> {
+        let slot = U256::from(7);
+        let address = Address::random();
+        let legacy = TickLevel::with_values(11, 22, 33);
+        let updated = TickLevel::with_values(44, 55, 0);
+
+        for spec in [
+            TempoHardfork::T0,
+            TempoHardfork::T3,
+            TempoHardfork::T10,
+            TempoHardfork::T11,
+            TempoHardfork::T12,
+        ] {
+            let is_t12 = spec.is_t12();
+            let mut storage = HashMapStorageProvider::new_with_spec(1, spec);
+            StorageCtx::enter(&mut storage, || {
+                Handler::<TickLevel>::write(&mut TickLevelHandler::new(slot, address), legacy)
+            })?;
+
+            storage.reset_counters();
+            let level =
+                StorageCtx::enter(&mut storage, || TickLevelHandler::new(slot, address).read())?;
+            assert_eq!(level.links, legacy.links);
+            assert_eq!(level.total_liquidity, if is_t12 { 0 } else { 33 });
+            assert_eq!(storage.counter_sload(), if is_t12 { 1 } else { 2 });
+            assert_eq!(storage.counter_sstore(), 0);
+
+            storage.reset_counters();
+            StorageCtx::enter(&mut storage, || {
+                TickLevelHandler::new(slot, address).write(updated)
+            })?;
+            assert_eq!(storage.counter_sload(), if spec.is_t4() { 0 } else { 2 });
+            assert_eq!(storage.counter_sstore(), if is_t12 { 1 } else { 2 });
+
+            storage.reset_counters();
+            StorageCtx::enter(&mut storage, || {
+                TickLevelHandler::new(slot, address).delete()
+            })?;
+            assert_eq!(storage.counter_sload(), 0);
+            assert_eq!(storage.counter_sstore(), if is_t12 { 1 } else { 2 });
+
+            let stored = StorageCtx::enter(&mut storage, || {
+                Handler::<TickLevel>::read(&TickLevelHandler::new(slot, address))
+            })?;
+            assert_eq!(stored.links, TickLevelLinks::default());
+            assert_eq!(stored.total_liquidity, if is_t12 { 33 } else { 0 });
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_orderbook_creation() {
+        let base = address!("0x1111111111111111111111111111111111111111");
+        let quote = address!("0x2222222222222222222222222222222222222222");
+        let book = Orderbook::new(base, quote);
+
+        assert_eq!(book.base, base);
+        assert_eq!(book.quote, quote);
+        assert_eq!(book.best_bid_tick, i16::MIN);
+        assert_eq!(book.best_ask_tick, i16::MAX);
+        assert!(book.is_initialized());
+    }
+
+    #[test]
+    fn test_tick_price_conversion() -> eyre::Result<()> {
+        // Test at peg price (tick 0)
+        assert_eq!(tick_to_price(0), PRICE_SCALE);
+        assert_eq!(price_to_tick(PRICE_SCALE)?, 0);
+
+        // Test above peg
+        assert_eq!(tick_to_price(100), PRICE_SCALE + 100);
+        assert_eq!(price_to_tick(PRICE_SCALE + 100)?, 100);
+
+        // Test below peg
+        assert_eq!(tick_to_price(-100), PRICE_SCALE - 100);
+        assert_eq!(price_to_tick(PRICE_SCALE - 100)?, -100);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_price_to_tick_below_min() {
+        // Price below MIN_PRICE should return an error
+        let result = price_to_tick(MIN_PRICE - 1);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TempoPrecompileError::StablecoinDEX(StablecoinDEXError::TickOutOfBounds(_))
+        ));
+    }
+
+    #[test]
+    fn test_price_to_tick_above_max() {
+        // Price above MAX_PRICE should return an error
+        let result = price_to_tick(MAX_PRICE + 1);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TempoPrecompileError::StablecoinDEX(StablecoinDEXError::TickOutOfBounds(_))
+        ));
+    }
+
+    #[test]
+    fn test_price_to_tick_at_min_boundary() {
+        let result = price_to_tick(MIN_PRICE);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), MIN_TICK);
+        assert_eq!(MIN_PRICE, (PRICE_SCALE as i32 + i32::from(MIN_TICK)) as u32);
+    }
+
+    #[test]
+    fn test_price_to_tick_at_max_boundary() {
+        let result = price_to_tick(MAX_PRICE);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), MAX_TICK);
+        assert_eq!(MAX_PRICE, (PRICE_SCALE as i32 + i32::from(MAX_TICK)) as u32);
+    }
+
+    #[test]
+    fn test_tick_bounds() {
+        assert_eq!(MIN_TICK, -2000);
+        assert_eq!(MAX_TICK, 2000);
+
+        // Test boundary values
+        assert_eq!(tick_to_price(MIN_TICK), PRICE_SCALE - 2000);
+        assert_eq!(tick_to_price(MAX_TICK), PRICE_SCALE + 2000);
+    }
+
+    #[test]
+    fn test_validate_tick_spacing() {
+        let mut rng = rand_08::thread_rng();
+
+        assert!(validate_tick_spacing(0).is_ok());
+        assert!(validate_tick_spacing(10).is_ok());
+        assert!(validate_tick_spacing(-10).is_ok());
+        assert!(validate_tick_spacing(100).is_ok());
+        assert!(validate_tick_spacing(MIN_TICK).is_ok());
+        assert!(validate_tick_spacing(MAX_TICK).is_ok());
+
+        for _ in 0..100 {
+            let tick = rng.gen_range(MIN_TICK..=MAX_TICK) * TICK_SPACING;
+            assert!(validate_tick_spacing(tick).is_ok());
+        }
+
+        for _ in 0..100 {
+            let offset = rng.gen_range(1..TICK_SPACING);
+            let base = rng.gen_range(MIN_TICK..=MAX_TICK) * TICK_SPACING;
+            let tick = base + offset;
+            assert!(validate_tick_spacing(tick).is_err());
+        }
+    }
+
+    #[test]
+    fn test_compute_book_key() {
+        let base = address!("0x1111111111111111111111111111111111111111");
+        let quote = address!("0x2222222222222222222222222222222222222222");
+
+        let key_bq = compute_book_key(base, quote);
+        let key_qb = compute_book_key(quote, base);
+
+        assert_ne!(key_bq, key_qb);
+
+        let mut buf = [0u8; 40];
+        buf[..20].copy_from_slice(base.as_slice());
+        buf[20..].copy_from_slice(quote.as_slice());
+        let expected_hash = keccak256(buf);
+
+        assert_eq!(key_bq, expected_hash,);
+    }
+
+    mod bitmap_tests {
+        use super::*;
+        use crate::{
+            stablecoin_dex::StablecoinDEX,
+            storage::{StorageCtx, hashmap::HashMapStorageProvider},
+        };
+        const BOOK_KEY: B256 = B256::ZERO;
+
+        #[test]
+        fn test_tick_lifecycle() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Test full lifecycle (set, check, clear, check) for positive and negative ticks
+                // Include boundary cases, word boundaries, and various representative values
+                let test_ticks = [
+                    MIN_TICK, -1000, -500, -257, -256, -100, -1, 0, 1, 100, 255, 256, 500, 1000,
+                    MAX_TICK,
+                ];
+
+                for &tick in &test_ticks {
+                    // Initially not set
+                    assert!(
+                        !book_handler.is_tick_initialized(tick, true)?,
+                        "Tick {tick} should not be initialized initially"
+                    );
+
+                    // Set the bit
+                    book_handler.set_tick_bit(tick, true)?;
+
+                    assert!(
+                        book_handler.is_tick_initialized(tick, true)?,
+                        "Tick {tick} should be initialized after set"
+                    );
+
+                    // Clear the bit
+                    book_handler.delete_tick_bit(tick, true)?;
+
+                    assert!(
+                        !book_handler.is_tick_initialized(tick, true)?,
+                        "Tick {tick} should not be initialized after clear"
+                    );
+                }
+
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_boundary_ticks() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Test MIN_TICK
+                book_handler.set_tick_bit(MIN_TICK, true)?;
+
+                assert!(
+                    book_handler.is_tick_initialized(MIN_TICK, true)?,
+                    "MIN_TICK should be settable"
+                );
+
+                // Test MAX_TICK (use different storage for ask side)
+                book_handler.set_tick_bit(MAX_TICK, false)?;
+
+                assert!(
+                    book_handler.is_tick_initialized(MAX_TICK, false)?,
+                    "MAX_TICK should be settable"
+                );
+
+                // Clear MIN_TICK
+                book_handler.delete_tick_bit(MIN_TICK, true)?;
+
+                assert!(
+                    !book_handler.is_tick_initialized(MIN_TICK, true)?,
+                    "MIN_TICK should be clearable"
+                );
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_bid_and_ask_separate() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                let tick = 100;
+
+                // Set as bid
+                book_handler.set_tick_bit(tick, true)?;
+
+                assert!(
+                    book_handler.is_tick_initialized(tick, true)?,
+                    "Tick should be initialized for bids"
+                );
+                assert!(
+                    !book_handler.is_tick_initialized(tick, false)?,
+                    "Tick should not be initialized for asks"
+                );
+
+                // Set as ask
+                book_handler.set_tick_bit(tick, false)?;
+
+                assert!(
+                    book_handler.is_tick_initialized(tick, true)?,
+                    "Tick should still be initialized for bids"
+                );
+                assert!(
+                    book_handler.is_tick_initialized(tick, false)?,
+                    "Tick should now be initialized for asks"
+                );
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_ticks_across_word_boundary() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Ticks that span word boundary at 256
+                book_handler.set_tick_bit(255, true)?; // word_index = 0, bit_index = 255
+                book_handler.set_tick_bit(256, true)?; // word_index = 1, bit_index = 0
+
+                assert!(book_handler.is_tick_initialized(255, true)?);
+                assert!(book_handler.is_tick_initialized(256, true)?);
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_ticks_different_words() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Test ticks in different words (both positive and negative)
+
+                // Negative ticks in different words
+                book_handler.set_tick_bit(-1, true)?; // word_index = -1, bit_index = 255
+                book_handler.set_tick_bit(-100, true)?; // word_index = -1, bit_index = 156
+                book_handler.set_tick_bit(-256, true)?; // word_index = -1, bit_index = 0
+                book_handler.set_tick_bit(-257, true)?; // word_index = -2, bit_index = 255
+
+                // Positive ticks in different words
+                book_handler.set_tick_bit(1, true)?; // word_index = 0, bit_index = 1
+                book_handler.set_tick_bit(100, true)?; // word_index = 0, bit_index = 100
+                book_handler.set_tick_bit(256, true)?; // word_index = 1, bit_index = 0
+                book_handler.set_tick_bit(512, true)?; // word_index = 2, bit_index = 0
+
+                // Verify negative ticks
+                assert!(book_handler.is_tick_initialized(-1, true)?);
+                assert!(book_handler.is_tick_initialized(-100, true)?);
+                assert!(book_handler.is_tick_initialized(-256, true)?);
+                assert!(book_handler.is_tick_initialized(-257, true)?);
+
+                // Verify positive ticks
+                assert!(book_handler.is_tick_initialized(1, true)?);
+                assert!(book_handler.is_tick_initialized(100, true)?);
+                assert!(book_handler.is_tick_initialized(256, true)?);
+                assert!(book_handler.is_tick_initialized(512, true)?);
+
+                // Verify unset ticks
+                assert!(
+                    !book_handler.is_tick_initialized(-50, true)?,
+                    "Unset negative tick should not be initialized"
+                );
+                assert!(
+                    !book_handler.is_tick_initialized(50, true)?,
+                    "Unset positive tick should not be initialized"
+                );
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_set_tick_bit_out_of_bounds() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Test tick above MAX_TICK
+                let result = book_handler.set_tick_bit(MAX_TICK + 1, true);
+                assert!(result.is_err());
+                assert!(matches!(
+                    result.unwrap_err(),
+                    TempoPrecompileError::StablecoinDEX(StablecoinDEXError::InvalidTick(_))
+                ));
+
+                // Test tick below MIN_TICK
+                let result = book_handler.set_tick_bit(MIN_TICK - 1, true);
+                assert!(result.is_err());
+                assert!(matches!(
+                    result.unwrap_err(),
+                    TempoPrecompileError::StablecoinDEX(StablecoinDEXError::InvalidTick(_))
+                ));
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_clear_tick_bit_out_of_bounds() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Test tick above MAX_TICK
+                let result = book_handler.delete_tick_bit(MAX_TICK + 1, true);
+                assert!(result.is_err());
+                assert!(matches!(
+                    result.unwrap_err(),
+                    TempoPrecompileError::StablecoinDEX(StablecoinDEXError::InvalidTick(_))
+                ));
+
+                // Test tick below MIN_TICK
+                let result = book_handler.delete_tick_bit(MIN_TICK - 1, true);
+                assert!(result.is_err());
+                assert!(matches!(
+                    result.unwrap_err(),
+                    TempoPrecompileError::StablecoinDEX(StablecoinDEXError::InvalidTick(_))
+                ));
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_is_tick_initialized_out_of_bounds() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let exchange = StablecoinDEX::new();
+                let book_handler = &exchange.books[BOOK_KEY];
+
+                // Test tick above MAX_TICK
+                let result = book_handler.is_tick_initialized(MAX_TICK + 1, true);
+                assert!(result.is_err());
+                assert!(matches!(
+                    result.unwrap_err(),
+                    TempoPrecompileError::StablecoinDEX(StablecoinDEXError::InvalidTick(_))
+                ));
+
+                // Test tick below MIN_TICK
+                let result = book_handler.is_tick_initialized(MIN_TICK - 1, true);
+                assert!(result.is_err());
+                assert!(matches!(
+                    result.unwrap_err(),
+                    TempoPrecompileError::StablecoinDEX(StablecoinDEXError::InvalidTick(_))
+                ));
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_next_initialized_ask_tick_same_word() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Set ticks 10 and 50 (both in word 0)
+                book_handler.set_tick_bit(10, false)?;
+                book_handler.set_tick_bit(50, false)?;
+
+                // From tick 0, should find tick 10
+                let (next, found) = book_handler.next_initialized_tick(0, false)?;
+                assert!(found);
+                assert_eq!(next, 10);
+
+                // From tick 10, should find tick 50
+                let (next, found) = book_handler.next_initialized_tick(10, false)?;
+                assert!(found);
+                assert_eq!(next, 50);
+
+                // From tick 50, should find nothing in bounds
+                let (next, found) = book_handler.next_initialized_tick(50, false)?;
+                assert!(!found);
+                assert!(next > MAX_TICK);
+
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_next_initialized_ask_tick_cross_word() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Set ticks in different words: 100 (word 0), 300 (word 1), 600 (word 2)
+                book_handler.set_tick_bit(100, false)?;
+                book_handler.set_tick_bit(300, false)?;
+                book_handler.set_tick_bit(600, false)?;
+
+                // From tick 0, should find tick 100 (same word)
+                let (next, found) = book_handler.next_initialized_tick(0, false)?;
+                assert!(found);
+                assert_eq!(next, 100);
+
+                // From tick 100, should find tick 300 (cross word boundary)
+                let (next, found) = book_handler.next_initialized_tick(100, false)?;
+                assert!(found);
+                assert_eq!(next, 300);
+
+                // From tick 300, should find tick 600 (cross word boundary)
+                let (next, found) = book_handler.next_initialized_tick(300, false)?;
+                assert!(found);
+                assert_eq!(next, 600);
+
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_next_initialized_bid_tick_same_word() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Set ticks 10 and 50 (both in word 0) for bids
+                book_handler.set_tick_bit(10, true)?;
+                book_handler.set_tick_bit(50, true)?;
+
+                // From tick 100, should find tick 50
+                let (next, found) = book_handler.next_initialized_tick(100, true)?;
+                assert!(found);
+                assert_eq!(next, 50);
+
+                // From tick 50, should find tick 10
+                let (next, found) = book_handler.next_initialized_tick(50, true)?;
+                assert!(found);
+                assert_eq!(next, 10);
+
+                // From tick 10, should find nothing in bounds
+                let (next, found) = book_handler.next_initialized_tick(10, true)?;
+                assert!(!found);
+                assert!(next < MIN_TICK);
+
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_next_initialized_bid_tick_cross_word() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Set ticks in different words for bids: 600 (word 2), 300 (word 1), 100 (word 0)
+                book_handler.set_tick_bit(600, true)?;
+                book_handler.set_tick_bit(300, true)?;
+                book_handler.set_tick_bit(100, true)?;
+
+                // From tick 700, should find tick 600 (same word)
+                let (next, found) = book_handler.next_initialized_tick(700, true)?;
+                assert!(found);
+                assert_eq!(next, 600);
+
+                // From tick 600, should find tick 300 (cross word boundary)
+                let (next, found) = book_handler.next_initialized_tick(600, true)?;
+                assert!(found);
+                assert_eq!(next, 300);
+
+                // From tick 300, should find tick 100 (cross word boundary)
+                let (next, found) = book_handler.next_initialized_tick(300, true)?;
+                assert!(found);
+                assert_eq!(next, 100);
+
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_next_initialized_tick_negative_ticks() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Set negative ticks for asks
+                book_handler.set_tick_bit(-500, false)?;
+                book_handler.set_tick_bit(-100, false)?;
+                book_handler.set_tick_bit(50, false)?;
+
+                // From -600, should find -500
+                let (next, found) = book_handler.next_initialized_tick(-600, false)?;
+                assert!(found);
+                assert_eq!(next, -500);
+
+                // From -500, should find -100
+                let (next, found) = book_handler.next_initialized_tick(-500, false)?;
+                assert!(found);
+                assert_eq!(next, -100);
+
+                // From -100, should find 50
+                let (next, found) = book_handler.next_initialized_tick(-100, false)?;
+                assert!(found);
+                assert_eq!(next, 50);
+
+                // Set negative ticks for bids
+                book_handler.set_tick_bit(-100, true)?;
+                book_handler.set_tick_bit(-500, true)?;
+
+                // From 0, should find -100
+                let (next, found) = book_handler.next_initialized_tick(0, true)?;
+                assert!(found);
+                assert_eq!(next, -100);
+
+                // From -100, should find -500
+                let (next, found) = book_handler.next_initialized_tick(-100, true)?;
+                assert!(found);
+                assert_eq!(next, -500);
+
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn test_next_initialized_tick_at_word_boundary() -> eyre::Result<()> {
+            let mut storage = HashMapStorageProvider::new(1);
+            StorageCtx::enter(&mut storage, || {
+                let mut exchange = StablecoinDEX::new();
+                exchange.initialize()?;
+                let book_handler = &mut exchange.books[BOOK_KEY];
+
+                // Test exact word boundaries (256, 512, -256, -512)
+                book_handler.set_tick_bit(255, false)?; // Last bit of word 0
+                book_handler.set_tick_bit(256, false)?; // First bit of word 1
+
+                // From 254, should find 255
+                let (next, found) = book_handler.next_initialized_tick(254, false)?;
+                assert!(found);
+                assert_eq!(next, 255);
+
+                // From 255, should find 256 (cross word)
+                let (next, found) = book_handler.next_initialized_tick(255, false)?;
+                assert!(found);
+                assert_eq!(next, 256);
+
+                // Test bid direction at word boundary
+                book_handler.set_tick_bit(256, true)?;
+                book_handler.set_tick_bit(255, true)?;
+
+                // From 257, should find 256
+                let (next, found) = book_handler.next_initialized_tick(257, true)?;
+                assert!(found);
+                assert_eq!(next, 256);
+
+                // From 256, should find 255 (cross word going down)
+                let (next, found) = book_handler.next_initialized_tick(256, true)?;
+                assert!(found);
+                assert_eq!(next, 255);
+
+                Ok(())
+            })
+        }
+    }
+
+    mod rounding_tests {
+        use super::*;
+
+        #[test]
+        fn test_base_to_quote_rounds_down_correctly() {
+            let base_amount = 1_000_003u128;
+            let tick = 0i16;
+
+            let quote_down = base_to_quote(base_amount, tick, RoundingDirection::Down).unwrap();
+            let quote_up = base_to_quote(base_amount, tick, RoundingDirection::Up).unwrap();
+
+            assert_eq!(quote_down, 1_000_003);
+            assert_eq!(quote_up, 1_000_003);
+        }
+
+        #[test]
+        fn test_base_to_quote_rounds_up_when_remainder_exists() {
+            let base_amount = 33u128;
+            let tick = 100i16;
+
+            let price = u128::from(tick_to_price(tick));
+            let numerator = base_amount * price;
+            let has_remainder = !numerator.is_multiple_of(u128::from(PRICE_SCALE));
+
+            let quote_down = base_to_quote(base_amount, tick, RoundingDirection::Down).unwrap();
+            let quote_up = base_to_quote(base_amount, tick, RoundingDirection::Up).unwrap();
+
+            if has_remainder {
+                assert_eq!(
+                    quote_up,
+                    quote_down + 1,
+                    "Round up should be 1 more than round down when there's a remainder"
+                );
+            } else {
+                assert_eq!(
+                    quote_up, quote_down,
+                    "Round up and down should be equal when there's no remainder"
+                );
+            }
+        }
+
+        #[test]
+        fn test_quote_to_base_rounds_down_correctly() {
+            let quote_amount = 1_000_003u128;
+            let tick = 0i16;
+
+            let base_down = quote_to_base(quote_amount, tick, RoundingDirection::Down).unwrap();
+            let base_up = quote_to_base(quote_amount, tick, RoundingDirection::Up).unwrap();
+
+            assert_eq!(base_down, 1_000_003);
+            assert_eq!(base_up, 1_000_003);
+        }
+
+        #[test]
+        fn test_quote_to_base_rounds_up_when_remainder_exists() {
+            let quote_amount = 33u128;
+            let tick = 100i16;
+
+            let price = u128::from(tick_to_price(tick));
+            let numerator = quote_amount * u128::from(PRICE_SCALE);
+            let has_remainder = !numerator.is_multiple_of(price);
+
+            let base_down = quote_to_base(quote_amount, tick, RoundingDirection::Down).unwrap();
+            let base_up = quote_to_base(quote_amount, tick, RoundingDirection::Up).unwrap();
+
+            if has_remainder {
+                assert_eq!(
+                    base_up,
+                    base_down + 1,
+                    "Round up should be 1 more than round down when there's a remainder"
+                );
+            } else {
+                assert_eq!(
+                    base_up, base_down,
+                    "Round up and down should be equal when there's no remainder"
+                );
+            }
+        }
+
+        #[test]
+        fn test_rounding_favors_protocol_for_bid_escrow() {
+            let base_amount = 10_000_001u128;
+            let tick = 100i16;
+
+            let escrow_floor = base_to_quote(base_amount, tick, RoundingDirection::Down).unwrap();
+            let escrow_ceil = base_to_quote(base_amount, tick, RoundingDirection::Up).unwrap();
+
+            assert!(
+                escrow_ceil >= escrow_floor,
+                "Ceiling should never be less than floor"
+            );
+        }
+
+        #[test]
+        fn test_rounding_favors_protocol_for_settlement() {
+            let base_amount = 10_000_001u128;
+            let tick = 100i16;
+
+            let payout_floor = base_to_quote(base_amount, tick, RoundingDirection::Down).unwrap();
+            let payout_ceil = base_to_quote(base_amount, tick, RoundingDirection::Up).unwrap();
+
+            assert!(
+                payout_floor <= payout_ceil,
+                "Floor should never be more than ceiling"
+            );
+        }
+    }
+
+    mod u256_upcast_tests {
+        use super::*;
+
+        #[test]
+        fn test_base_to_quote_large_amount_no_overflow() {
+            let large_base_amount: u128 = u128::MAX / 100_000;
+            let result = base_to_quote(large_base_amount, MAX_TICK, RoundingDirection::Down);
+
+            assert!(
+                result.is_some(),
+                "base_to_quote should handle large amounts without overflow using U256"
+            );
+
+            let expected = large_base_amount
+                .checked_mul(102)
+                .and_then(|v| v.checked_div(100));
+            assert_eq!(result, expected);
+        }
+
+        #[test]
+        fn test_quote_to_base_large_amount_no_overflow() {
+            let large_quote_amount: u128 = (u128::MAX / u128::from(PRICE_SCALE)) + 1;
+
+            assert!(
+                large_quote_amount
+                    .checked_mul(u128::from(PRICE_SCALE))
+                    .is_none(),
+                "Test setup: this value should overflow u128 multiplication"
+            );
+
+            let result = quote_to_base(large_quote_amount, MAX_TICK, RoundingDirection::Down);
+
+            assert!(
+                result.is_some(),
+                "quote_to_base should handle large amounts without overflow using U256"
+            );
+        }
+    }
+}

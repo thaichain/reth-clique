@@ -1,0 +1,186 @@
+//! [TIP-1022] virtual address registry precompile. Enabled on `TempoHardfork::T3`.
+//!
+//! Provides on-chain registration of virtual-address masters and resolution of
+//! [TIP-1022] virtual addresses back to their registered master EOA/contract.
+//!
+//! [TIP-1022]: <https://docs.tempo.xyz/protocol/tip1022>
+
+pub mod dispatch;
+
+use crate::{
+    ADDRESS_REGISTRY_ADDRESS,
+    error::Result,
+    storage::{Handler, Mapping},
+};
+use alloy::{
+    primitives::{Address, FixedBytes, keccak256},
+    sol_types::SolValue,
+};
+use tempo_chainspec::hardfork::TempoHardfork;
+pub use tempo_contracts::precompiles::{
+    AddrRegistryError, AddrRegistryEvent, IAddressRegistry, STABLECOIN_DEX_ADDRESS,
+    TIP_FEE_MANAGER_ADDRESS, TIP20_CHANNEL_RESERVE_ADDRESS,
+};
+use tempo_precompiles_macros::{Storable, contract};
+pub use tempo_primitives::{MasterId, TempoAddressExt, UserTag};
+
+/// TIP-1035 Implicit Approval List.
+///
+/// Precompiles on this list are authorized to call
+/// [`crate::tip20::TIP20Token::system_transfer_from`], pulling TIP-20 tokens from a user without a
+/// prior `approve()`. The list is gated on `TempoHardfork::T5`; before activation it is empty.
+pub const IMPLICIT_APPROVAL_LIST: &[Address] = &[
+    TIP_FEE_MANAGER_ADDRESS,
+    STABLECOIN_DEX_ADDRESS,
+    TIP20_CHANNEL_RESERVE_ADDRESS,
+];
+
+/// Returns `true` iff `addr` is on the [`IMPLICIT_APPROVAL_LIST`] for the given hardfork.
+///
+/// Before `TempoHardfork::T5` (TIP-1035 activation), returns `false` for all addresses.
+pub fn is_implicitly_approved(addr: Address, hardfork: TempoHardfork) -> bool {
+    if !hardfork.is_t5() {
+        return false;
+    }
+    IMPLICIT_APPROVAL_LIST.contains(&addr)
+}
+
+/// [TIP-1022] virtual address registry contract.
+///
+/// Maps a 4-byte [`MasterId`] to its registered master address and metadata.
+/// Registration requires a 32-bit proof-of-work to prevent squatting.
+///
+/// The struct fields define the on-chain storage layout; the `#[contract]` macro generates the
+/// storage handlers which provide an ergonomic way to interact with the EVM state.
+///
+/// [TIP-1022]: <https://docs.tempo.xyz/protocol/tip1022>
+#[contract(addr = ADDRESS_REGISTRY_ADDRESS)]
+pub struct AddressRegistry {
+    /// Maps `masterId → RegistryData` (master address + metadata).
+    data: Mapping<MasterId, RegistryData>,
+}
+
+/// Storage record for a registered master. Packed into a single 32-byte slot.
+#[derive(Debug, Clone, Default, Storable)]
+struct RegistryData {
+    /// The EOA or contract that owns this `masterId`.
+    master_address: Address,
+    /// Reserved bytes for future use.
+    reserved: FixedBytes<11>,
+    /// Master type discriminator (currently unused, always `0`).
+    ty: u8,
+}
+
+impl RegistryData {
+    /// Returns the master address, or `None` if the slot is empty (`address(0)`).
+    fn master_address(&self) -> Option<Address> {
+        match self.master_address {
+            Address::ZERO => None,
+            master => Some(master),
+        }
+    }
+}
+
+impl AddressRegistry {
+    /// Initializes the registry contract by setting its bytecode marker.
+    pub fn initialize(&mut self) -> Result<()> {
+        self.__initialize()
+    }
+
+    // ────────────────── Registration ──────────────────
+
+    /// Registers `msg_sender` as a virtual-address master.
+    ///
+    /// The registration hash is `keccak256(abi.encodePacked(msg.sender, salt))`.
+    /// The first 4 bytes MUST be zero (32-bit proof-of-work). `masterId` is bytes `[4:8]`.
+    ///
+    /// # Errors
+    /// - `InvalidMasterAddress` — `msg_sender` is zero, a virtual address, or a TIP-20 token
+    /// - `ProofOfWorkFailed` — the first 4 bytes of the registration hash are not zero
+    /// - `MasterIdCollision` — the derived `masterId` is already registered
+    pub fn register_virtual_master(
+        &mut self,
+        msg_sender: Address,
+        call: IAddressRegistry::registerVirtualMasterCall,
+    ) -> Result<MasterId> {
+        // Validate master address
+        if !msg_sender.is_valid_master() {
+            return Err(AddrRegistryError::invalid_master_address().into());
+        }
+
+        // Compute registration hash: keccak256(abi.encodePacked(msg.sender, salt))
+        let registration_hash = keccak256((msg_sender, call.salt).abi_encode_packed());
+
+        // 32-bit PoW: first 4 bytes must be zero
+        if registration_hash[0..4] != [0u8; 4] {
+            return Err(AddrRegistryError::proof_of_work_failed().into());
+        }
+
+        // masterId = bytes [4:8]
+        let master_id = MasterId::from_slice(&registration_hash[4..8]);
+
+        // Ensure no collisions
+        if let Some(master) = self.data[master_id].read()?.master_address() {
+            return Err(AddrRegistryError::master_id_collision(master).into());
+        }
+
+        // Store the registration
+        self.data[master_id].write(RegistryData {
+            master_address: msg_sender,
+            reserved: FixedBytes::ZERO,
+            ty: 0,
+        })?;
+
+        // Emit event
+        self.emit_event(AddrRegistryEvent::master_registered(master_id, msg_sender))?;
+
+        Ok(master_id)
+    }
+
+    // ────────────────── View Functions ──────────────────
+
+    /// Returns the registered master address for `master_id`, or `None` if unregistered.
+    pub fn get_master(&self, master_id: MasterId) -> Result<Option<Address>> {
+        Ok(self.data[master_id].read()?.master_address())
+    }
+
+    /// Resolves a transfer recipient using virtual address semantics.
+    ///
+    /// Non-virtual addresses are returned unchanged.
+    /// Virtual addresses are resolved to their registered master.
+    ///
+    /// # Errors
+    /// - `VirtualAddressUnregistered` — `to` is a virtual address whose `masterId` is not registered
+    pub fn resolve_recipient(&self, to: Address) -> Result<Address> {
+        // Explicit check because it isn't exclusively a view function.
+        // It is also used by `tip20::Recipient`.
+        if !self.storage.spec().is_t3() {
+            return Ok(to);
+        }
+
+        match to.decode_virtual() {
+            None => Ok(to),
+            Some((master_id, _)) => self
+                .get_master(master_id)?
+                .ok_or(AddrRegistryError::virtual_address_unregistered().into()),
+        }
+    }
+
+    /// Resolves a virtual address to its registered master.
+    ///
+    /// Returns `address(0)` if the address is not virtual or the [`MasterId`] is unregistered.
+    pub fn resolve_virtual_address(&self, addr: Address) -> Result<Address> {
+        match addr.decode_virtual() {
+            None => Ok(Address::ZERO),
+            Some((master_id, _)) => Ok(self.get_master(master_id)?.unwrap_or(Address::ZERO)),
+        }
+    }
+
+    /// Returns `true` iff `addr` is on the TIP-1035 [`IMPLICIT_APPROVAL_LIST`] for the active
+    /// hardfork. Returns `false` for all addresses before `TempoHardfork::T5`.
+    pub fn is_implicitly_approved(&self, addr: Address) -> bool {
+        is_implicitly_approved(addr, self.storage.spec())
+    }
+}
+
+

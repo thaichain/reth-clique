@@ -1,0 +1,109 @@
+pub use IFeeManager::{IFeeManagerErrors as FeeManagerError, IFeeManagerEvents as FeeManagerEvent};
+pub use ITIPFeeAMM::{ITIPFeeAMMErrors as TIPFeeAMMError, ITIPFeeAMMEvents as TIPFeeAMMEvent};
+
+crate::sol! {
+    /// FeeManager interface for managing gas fee collection and distribution.
+    ///
+    /// IMPORTANT: FeeManager inherits from TIPFeeAMM and shares the same storage layout.
+    /// This means:
+    /// - FeeManager has all the functionality of TIPFeeAMM (pool management, swaps, liquidity operations)
+    /// - Both contracts use the same storage slots for AMM data (pools, reserves, liquidity balances)
+    /// - FeeManager extends TIPFeeAMM with additional storage slots (4-15) for fee-specific data
+    /// - When deployed, FeeManager IS a TIPFeeAMM with additional fee management capabilities
+    ///
+    /// Storage layout:
+    /// - Slots 0-3: TIPFeeAMM storage (pools, pool exists, liquidity data)
+    /// - Slots 4+: FeeManager-specific storage (validator tokens, user tokens, collected fees, etc.)
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(abi)]
+    interface IFeeManager {
+        // Structs
+        struct FeeInfo {
+            uint128 amount;
+            bool hasBeenSet;
+        }
+
+        // User preferences
+        function userTokens(address user) external view returns (address);
+        function validatorTokens(address validator) external view returns (address);
+        function setUserToken(address token) external;
+        function setValidatorToken(address token) external;
+
+        // Fee functions
+        function distributeFees(address validator, address token) external;
+        function collectedFees(address validator, address token) external view returns (uint256);
+        // NOTE: collectFeePreTx is a protocol-internal function called directly by the
+        // execution handler, not exposed via the dispatch interface.
+
+        // Events
+        event UserTokenSet(address indexed user, address indexed token);
+        event ValidatorTokenSet(address indexed validator, address indexed token);
+        event FeesDistributed(address indexed validator, address indexed token, uint256 amount);
+
+        // Errors
+        error InvalidToken();
+        error InsufficientFeeTokenBalance();
+        error CannotChangeWithinBlock();
+    }
+}
+
+sol! {
+    /// TIPFeeAMM interface defining the base AMM functionality for stablecoin pools.
+    /// This interface provides core liquidity pool management and swap operations.
+    ///
+    /// NOTE: The FeeManager contract inherits from TIPFeeAMM and shares the same storage layout.
+    /// When FeeManager is deployed, it effectively "is" a TIPFeeAMM with additional fee management
+    /// capabilities layered on top. Both contracts operate on the same storage slots.
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(abi)]
+    #[allow(clippy::too_many_arguments)]
+    interface ITIPFeeAMM {
+        // Structs
+        struct Pool {
+            uint128 reserveUserToken;
+            uint128 reserveValidatorToken;
+        }
+
+        struct PoolKey {
+            address token0;
+            address token1;
+        }
+
+
+        // Constants
+        function M() external view returns (uint256);
+        function N() external view returns (uint256);
+        function SCALE() external view returns (uint256);
+        function MIN_LIQUIDITY() external view returns (uint256);
+
+        // Pool Management
+        function getPoolId(address userToken, address validatorToken) external pure returns (bytes32);
+        function getPool(address userToken, address validatorToken) external view returns (Pool memory);
+        function pools(bytes32 poolId) external view returns (Pool memory);
+
+        // Liquidity Operations
+        function mint(address userToken, address validatorToken, uint256 amountValidatorToken, address to) external returns (uint256 liquidity);
+        function burn(address userToken, address validatorToken, uint256 liquidity, address to) external returns (uint256 amountUserToken, uint256 amountValidatorToken);
+
+        // Liquidity Balances
+        function totalSupply(bytes32 poolId) external view returns (uint256);
+        function liquidityBalances(bytes32 poolId, address user) external view returns (uint256);
+
+        // Swapping
+        function rebalanceSwap(address userToken, address validatorToken, uint256 amountOut, address to) external returns (uint256 amountIn);
+
+        // Events
+        event Mint(address sender, address indexed to, address indexed userToken, address indexed validatorToken, uint256 amountValidatorToken, uint256 liquidity);
+        event Burn(address indexed sender, address indexed userToken, address indexed validatorToken, uint256 amountUserToken, uint256 amountValidatorToken, uint256 liquidity, address to);
+        event RebalanceSwap(address indexed userToken, address indexed validatorToken, address indexed swapper, uint256 amountIn, uint256 amountOut);
+
+        // Errors
+        error IdenticalAddresses();
+        error InvalidToken();
+        error InsufficientLiquidity();
+        error InsufficientReserves();
+        error InvalidAmount();
+        error DivisionByZero();
+        error InvalidSwapCalculation();
+    }
+}
