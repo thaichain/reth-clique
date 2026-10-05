@@ -361,8 +361,8 @@ impl CliqueConsensus {
             return Ok(());
         }
 
-        // Timestamp must respect the clique period
-        if parent.timestamp() + self.config.period > h.timestamp() {
+        // Timestamp must respect the clique period (fork-gated)
+        if parent.timestamp() + self.config.period_at(parent.timestamp()) > h.timestamp() {
             return Err(ConsensusError::other(CliqueError::InvalidTimestamp));
         }
 

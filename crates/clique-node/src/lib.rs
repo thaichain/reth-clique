@@ -16,6 +16,7 @@ pub mod parser;
 pub mod payload;
 pub mod rpc;
 pub mod signer;
+pub mod t0_seed;
 
 pub use engine_validator::{CliqueEngineValidator, CliqueEngineValidatorBuilder};
 pub use evm::{CliqueEvmConfig, CliqueExecutorBuilder, NoRewardSpec};

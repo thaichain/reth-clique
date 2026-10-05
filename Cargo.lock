@@ -2481,8 +2481,13 @@ dependencies = [
  "reth-primitives-traits",
  "reth-rpc-server-types",
  "reth-storage-errors",
+ "revm",
  "serde",
  "serde_json",
+ "tempo-contracts",
+ "tempo-hardfork",
+ "tempo-precompiles",
+ "tempo-primitives",
  "tokio",
  "tracing",
 ]

@@ -60,6 +60,13 @@ pub struct CliqueConfig {
     /// Timestamp at which the clique extension precompiles activate
     /// (genesis config key `cliquePrecompileTime`). `None` = never.
     pub precompile_time: Option<u64>,
+    /// Timestamp at which the T0 precompile suite activates and the fork
+    /// state seeding runs (genesis config key `t0Time`). `None` = never.
+    pub t0_time: Option<u64>,
+    /// Fork-gated clique period change (genesis config key
+    /// `cliquePeriodChange`: `{"time": <ts>, "period": <seconds>}`).
+    /// `None` = period never changes.
+    pub period_change: Option<(u64, u64)>,
 }
 
 impl CliqueConfig {
@@ -70,12 +77,35 @@ impl CliqueConfig {
             period,
             epoch: if epoch == 0 { DEFAULT_EPOCH_LENGTH } else { epoch },
             precompile_time: None,
+            t0_time: None,
+            period_change: None,
+        }
+    }
+
+    /// Returns the clique period in effect at the given timestamp
+    /// (fork-gated via `cliquePeriodChange`).
+    pub const fn period_at(&self, timestamp: u64) -> u64 {
+        match self.period_change {
+            Some((at, period)) if timestamp >= at => period,
+            _ => self.period,
         }
     }
 
     /// Sets the clique precompile activation timestamp (builder style).
     pub const fn with_precompile_time(mut self, precompile_time: Option<u64>) -> Self {
         self.precompile_time = precompile_time;
+        self
+    }
+
+    /// Sets the T0 suite activation timestamp (builder style).
+    pub const fn with_t0_time(mut self, t0_time: Option<u64>) -> Self {
+        self.t0_time = t0_time;
+        self
+    }
+
+    /// Sets the fork-gated period change (builder style).
+    pub const fn with_period_change(mut self, period_change: Option<(u64, u64)>) -> Self {
+        self.period_change = period_change;
         self
     }
 

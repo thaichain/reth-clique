@@ -118,7 +118,8 @@ where
         }
 
         let config = self.consensus.config();
-        let slot_time = parent.timestamp + config.period;
+        let period = config.period_at(parent.timestamp);
+        let slot_time = parent.timestamp + period;
         if now < slot_time {
             return Err(eyre::eyre!("too early for next slot"));
         }
@@ -142,8 +143,10 @@ where
 
         let inturn = snap.inturn(parent_number + 1, signer_addr);
         if !inturn {
-            // out-of-turn: add a random wiggle so the in-turn signer wins races
-            let wiggle_ms = (snap.signers.len() as u64 / 2 + 1) * 500;
+            // out-of-turn: add a random wiggle so the in-turn signer wins
+            // races. Scaled to the period so short slots stay usable
+            // (500ms is 1/20th of the legacy 10s period).
+            let wiggle_ms = (snap.signers.len() as u64 / 2 + 1) * period * 50;
             let since_slot_ms = (now - slot_time) * 1000;
             if since_slot_ms < wiggle_ms {
                 return Err(eyre::eyre!("out-of-turn, waiting for wiggle"));

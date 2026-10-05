@@ -71,10 +71,22 @@ pub fn clique_config_from_raw_config(
 ) -> Result<CliqueConfig, CliqueSpecError> {
     let value = config.get("clique").ok_or(CliqueSpecError::MissingClique)?;
     let raw: RawCliqueConfig = serde_json::from_value(value.clone())?;
-    // Tempo-style extension fork: `"cliquePrecompileTime": <unix ts>` at the
-    // config root activates the clique extension precompiles.
+    // Tempo-style extension forks at the config root:
+    //  - `"cliquePrecompileTime": <ts>` activates the clique extension precompile
+    //  - `"t0Time": <ts>` activates the T0 precompile suite + state seeding
+    //  - `"cliquePeriodChange": {"time": <ts>, "period": <seconds>}` forks the
+    //    clique block period
     let precompile_time = config.get("cliquePrecompileTime").and_then(|v| v.as_u64());
-    Ok(CliqueConfig::new(raw.period, raw.epoch).with_precompile_time(precompile_time))
+    let t0_time = config.get("t0Time").and_then(|v| v.as_u64());
+    let period_change = config.get("cliquePeriodChange").and_then(|v| {
+        let time = v.get("time").and_then(|v| v.as_u64())?;
+        let period = v.get("period").and_then(|v| v.as_u64())?;
+        Some((time, period))
+    });
+    Ok(CliqueConfig::new(raw.period, raw.epoch)
+        .with_precompile_time(precompile_time)
+        .with_t0_time(t0_time)
+        .with_period_change(period_change))
 }
 
 /// Validates clique-specific genesis constraints (geth `core/genesis.go`).

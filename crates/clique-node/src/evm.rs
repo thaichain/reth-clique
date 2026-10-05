@@ -36,6 +36,11 @@ use alloy_evm::{
     Database, EvmEnv, EvmFactory,
 };
 use alloy_primitives::{address, Address, B256, Bytes, U256};
+use std::cell::RefCell;
+use std::rc::Rc;
+use tempo_precompiles::{extend_tempo_precompiles, storage::actions::StorageActions};
+use tempo_precompiles::storage_credits::NonCreditableSlots;
+use tempo_hardfork::TempoHardfork;
 use reth_ethereum::{
     chainspec::{ChainSpec, EthChainSpec, EthereumHardfork, EthereumHardforks, ForkCondition},
     evm::{
@@ -132,34 +137,58 @@ fn clique_precompiles() -> [(Address, DynPrecompile); 1] {
     )]
 }
 
-/// EVM factory that injects the clique extension precompiles once the
-/// `cliquePrecompileTime` fork timestamp is reached (Tempo's
-/// `PrecompilesMap` pattern — no revm changes required).
+/// EVM factory that injects extension precompiles once their fork
+/// timestamps are reached (Tempo's `PrecompilesMap` pattern — no revm
+/// changes required).
 ///
-/// The vanilla sets are always derived from the block's `SpecId`; the clique
+/// - `precompile_time` activates the `cliqueSealHash` precompile.
+/// - `t0_time` activates the Tempo T0 core suite (stateful precompiles:
+///   TIP-20 tokens + factory, TIP-403 registry, nonce manager, account
+///   keychain, validator config v1/v2). Higher Tempo forks (T1+) are never
+///   activated; the fee-token stack is left out for native-gas operation.
+///
+/// The vanilla sets are always derived from the block's `SpecId`; extension
 /// precompiles are *added on top*, so activation is purely additive.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CliqueEvmFactory {
-    /// Timestamp at which [`clique_precompiles`] activate. `None` = never.
+    /// Timestamp at which the `cliqueSealHash` precompile activates.
     precompile_time: Option<u64>,
+    /// Timestamp at which the T0 precompile suite activates.
+    t0_time: Option<u64>,
 }
 
 impl CliqueEvmFactory {
-    /// Creates the factory with the given precompile activation timestamp.
-    pub const fn new(precompile_time: Option<u64>) -> Self {
-        Self { precompile_time }
+    /// Creates the factory with the given precompile activation timestamps.
+    pub const fn new(precompile_time: Option<u64>, t0_time: Option<u64>) -> Self {
+        Self { precompile_time, t0_time }
     }
 
     /// Builds the precompile set for a block: the vanilla set for the block's
-    /// `SpecId`, extended with the clique precompiles if the fork is active.
+    /// `SpecId`, extended with the extension precompiles if a fork is active.
     fn precompiles_map(&self, spec: SpecId, timestamp: U256) -> PrecompilesMap {
-        let map =
+        let mut map =
             PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec)));
         if self.precompile_time.is_some_and(|fork_time| timestamp >= U256::from(fork_time)) {
-            map.with_extended_precompiles(clique_precompiles())
-        } else {
-            map
+            map.extend_precompiles(clique_precompiles());
         }
+        if self.t0_time.is_some_and(|fork_time| timestamp >= U256::from(fork_time)) {
+            // Register the T0 core suite: the unconditional items in
+            // `extend_tempo_precompiles` (TIP-20 + factory, TIP-403, nonce
+            // manager, account keychain, validator config v1+v2). Higher
+            // Tempo forks stay inactive — the spec is pinned at T0, so
+            // is_t1()..is_t13() are all false. The fee-token stack
+            // (TipFeeManager/StablecoinDEX) is registered by the same call
+            // but is inert under native-gas fee handling.
+            let mut cfg = CfgEnv::<TempoHardfork>::default();
+            cfg.set_spec_and_mainnet_gas_params(TempoHardfork::T0);
+            extend_tempo_precompiles(
+                &mut map,
+                &cfg,
+                StorageActions::disabled(),
+                Rc::new(RefCell::new(NonCreditableSlots::empty())),
+            );
+        }
+        map
     }
 }
 
@@ -175,6 +204,10 @@ impl EvmFactory for CliqueEvmFactory {
     type Precompiles = PrecompilesMap;
 
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
+        // NOTE: T0 state seeding (`crate::t0_seed`) is NOT wired here yet —
+        // stateful T0 precompiles require a TempoBlockEnv-typed EVM context
+        // (EvmPrecompileStorageProvider downcasts), which needs the custom
+        // `CliqueEvm` wrapper (TempoEvm-style). Tracked for the T0 follow-up.
         let precompiles = self.precompiles_map(input.cfg_env.spec, input.block_env.timestamp);
         EthEvmBuilder::new(db, input).precompiles(precompiles).build()
     }
@@ -209,11 +242,14 @@ pub struct CliqueEvmConfig {
 impl CliqueEvmConfig {
     /// Creates a new clique EVM config for the given chain spec.
     ///
-    /// `precompile_time` activates the clique extension precompiles from the
-    /// given unix timestamp on (see [`CLIQUE_SEALHASH_ADDRESS`]); `None`
-    /// disables them.
-    pub fn new(chain_spec: Arc<ChainSpec>, precompile_time: Option<u64>) -> Self {
-        let evm_factory = CliqueEvmFactory::new(precompile_time);
+    /// `precompile_time` activates the `cliqueSealHash` precompile and
+    /// `t0_time` the T0 suite from their timestamps on; `None` disables.
+    pub fn new(
+        chain_spec: Arc<ChainSpec>,
+        precompile_time: Option<u64>,
+        t0_time: Option<u64>,
+    ) -> Self {
+        let evm_factory = CliqueEvmFactory::new(precompile_time, t0_time);
         let inner = EthEvmConfig::new_with_evm_factory(chain_spec.clone(), evm_factory);
         let executor_factory = EthBlockExecutorFactory::new(
             RethReceiptBuilder::default(),
@@ -375,9 +411,10 @@ where
         // The precompile fork time rides along in the clique config registry
         // (populated by the chain spec parser).
         let chain_id = ctx.chain_spec().chain().id();
-        let precompile_time =
-            clique_chainspec::registered_clique_config(chain_id).and_then(|c| c.precompile_time);
-        Ok(CliqueEvmConfig::new(ctx.chain_spec(), precompile_time))
+        let clique_config = clique_chainspec::registered_clique_config(chain_id);
+        let precompile_time = clique_config.as_ref().and_then(|c| c.precompile_time);
+        let t0_time = clique_config.as_ref().and_then(|c| c.t0_time);
+        Ok(CliqueEvmConfig::new(ctx.chain_spec(), precompile_time, t0_time))
     }
 }
 
@@ -441,7 +478,7 @@ mod tests {
 
     #[test]
     fn precompiles_activate_at_fork_time() {
-        let factory = CliqueEvmFactory::new(Some(1_000));
+        let factory = CliqueEvmFactory::new(Some(1_000), None);
 
         // before the fork: vanilla only
         let pre = factory.precompiles_map(SpecId::OSAKA, U256::from(999));
@@ -456,7 +493,8 @@ mod tests {
             .is_some());
 
         // fork never scheduled: never active
-        let never = CliqueEvmFactory::new(None).precompiles_map(SpecId::OSAKA, U256::MAX);
+        let never =
+            CliqueEvmFactory::new(None, None).precompiles_map(SpecId::OSAKA, U256::MAX);
         assert!(never.get(&CLIQUE_SEALHASH_ADDRESS).is_none());
     }
 }
